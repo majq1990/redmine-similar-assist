@@ -85,26 +85,52 @@ def detect_r_and_d_communication(journals: list[dict]) -> tuple[bool, list[str]]
         has_signal: True 表示已与研发沟通过，应跳过 AI 分析
         matched_keywords: 命中的关键词列表（用于通知文案）
     """
-    # 研发相关关键词（出现任一即认为已沟通）
-    PATTERNS = [
-        # 直接提到研发
-        "研发", "开发", "RD", "技术部", "研发部", "研发同事",
-        # 补提/已处理
-        "补提", "已补提", "已处理", "已解决", "已修复",
+    # ---- 排除模式：匹配到这些表示是"请求研发帮助"而非"研发已处理" ----
+    EXCLUDE_PATTERNS = [
+        "需研发", "请研发", "需要研发", "研发支持",
+        "研发配合", "研发协助", "研发处理", "研发排查",
+    ]
+
+    # ---- 肯定式关键词：出现任一即认为研发已沟通过 ----
+    AFFIRM_PATTERNS = [
+        # 研发已完成/确认（"研发已" 是最核心的信号）
+        "研发已", "研发确认", "研发回复", "研发反馈",
+        "研发回复已", "研发反馈已", "研发处理完成",
+        # 补提
+        "已补提", "已提单", "补提",
         # 沟通确认
         "已沟通", "已确认", "已反馈", "已告知", "已对接",
         # 状态类
+        "已处理", "已解决", "已修复", "已修改",
         "重复问题", "已知问题", "非bug", "非缺陷", "设计如此",
     ]
+
     matched = []
+    excluded = []
     for j in journals:
         notes_raw = j.get("notes") or ""
         notes_text = clean_html(notes_raw)
         if not notes_text:
             continue
-        for kw in PATTERNS:
+        # 先检查排除模式
+        for ep in EXCLUDE_PATTERNS:
+            if ep in notes_text and ep not in excluded:
+                excluded.append(ep)
+        # 再检查肯定式模式
+        for kw in AFFIRM_PATTERNS:
             if kw in notes_text and kw not in matched:
                 matched.append(kw)
+
+    # 如果同时命中排除模式和肯定模式，需要进一步判断
+    # 排除模式优先：如果一个 journal 同时包含"需研发"和"研发已"，
+    # "研发已"才是真正的处理证据；但如果只有"需研发"没有肯定式，则排除
+    if matched and excluded:
+        # 有肯定式证据存在，不排除
+        pass
+    elif excluded and not matched:
+        # 只有排除模式，没有肯定式 → 不触发
+        return False, []
+
     return bool(matched), matched
 
 
