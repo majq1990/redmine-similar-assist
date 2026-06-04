@@ -73,6 +73,41 @@ def build_issue_text(subject: str, description_html: str) -> str:
     return f"[标题] {subject}\n[正文] {desc}"
 
 
+def detect_r_and_d_communication(journals: list[dict]) -> tuple[bool, list[str]]:
+    """检测 journals 中是否有研发沟通/补提/已处理等信号。
+
+    只分析 journal notes 文本（不含截图/附件），按用户要求：
+    - "有截图，不能作为已经沟通的证据"
+    - "案件的文字内容进行识别，发现有和研发沟通过的记录、有提到补提等信息"
+
+    Returns:
+        (has_signal, matched_keywords)
+        has_signal: True 表示已与研发沟通过，应跳过 AI 分析
+        matched_keywords: 命中的关键词列表（用于通知文案）
+    """
+    # 研发相关关键词（出现任一即认为已沟通）
+    PATTERNS = [
+        # 直接提到研发
+        "研发", "开发", "RD", "技术部", "研发部", "研发同事",
+        # 补提/已处理
+        "补提", "已补提", "已处理", "已解决", "已修复",
+        # 沟通确认
+        "已沟通", "已确认", "已反馈", "已告知", "已对接",
+        # 状态类
+        "重复问题", "已知问题", "非bug", "非缺陷", "设计如此",
+    ]
+    matched = []
+    for j in journals:
+        notes_raw = j.get("notes") or ""
+        notes_text = clean_html(notes_raw)
+        if not notes_text:
+            continue
+        for kw in PATTERNS:
+            if kw in notes_text and kw not in matched:
+                matched.append(kw)
+    return bool(matched), matched
+
+
 def find_resolution_notes(journals: list[dict]) -> str:
     """从 journals 里挑解决方案候选：
 

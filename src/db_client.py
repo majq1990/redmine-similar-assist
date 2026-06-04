@@ -83,6 +83,15 @@ class RedmineDB:
             }
         return self._status_cache
 
+    def get_group_member_ids(self, group_id: int) -> set[int]:
+        """返回指定 Redmine 用户组的所有成员 user_id 集合。"""
+        with self._conn() as (_, cur):
+            cur.execute(
+                "SELECT user_id FROM groups_users WHERE group_id = %s",
+                (group_id,),
+            )
+            return {r["user_id"] for r in cur.fetchall()}
+
     def count_issues(self) -> int:
         with self._conn() as (_, cur):
             cur.execute("SELECT COUNT(*) AS n FROM issues")
@@ -105,7 +114,8 @@ class RedmineDB:
                     )
                 cur.execute(
                     f"""SELECT id, project_id, tracker_id, status_id, subject,
-                              description, closed_on, updated_on, created_on
+                              description, closed_on, updated_on, created_on,
+                              assigned_to_id
                           FROM issues
                          WHERE id > %s {proj_clause}
                          ORDER BY id ASC
@@ -142,7 +152,8 @@ class RedmineDB:
             )
             cur.execute(
                 f"""SELECT id, project_id, tracker_id, status_id, subject,
-                          description, closed_on, updated_on, created_on
+                          description, closed_on, updated_on, created_on,
+                          assigned_to_id
                       FROM issues
                      WHERE updated_on > %s {proj_clause}
                      ORDER BY updated_on ASC, id ASC

@@ -71,6 +71,15 @@ notify:
   # 钉钉加签 secret（SEC 开头）
   dingtalk_secret: "TODO_DINGTALK_SECRET"
 
+# 分诊：对"支持部受理"案件检测是否已与研发沟通，推送钉钉通知（旁路，不跳过 AI）
+triage:
+  enabled: false
+  status_id: 19               # 支持部受理
+  group_id: 1137              # 技术支持部
+  # 留空则复用 notify.dingtalk_webhook / notify.dingtalk_secret
+  notify_webhook: ""
+  notify_secret: ""
+
 # 回写策略
 write_back:
   enabled: false              # 阶段 1 先 false，只生成不真写；验证 OK 再改 true

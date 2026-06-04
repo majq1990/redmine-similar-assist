@@ -30,7 +30,8 @@ from .config import (
 )
 from .db_client import RedmineDB
 from .embedder import Embedder
-from .text_cleaner import build_issue_text, find_resolution_notes
+from .notify import post_dingtalk
+from .text_cleaner import build_issue_text, detect_r_and_d_communication, find_resolution_notes
 from .vector_store import VectorStore, get_vector_store
 
 
@@ -265,6 +266,20 @@ def run_once(max_items: int | None = None) -> dict:
         ai_triggered = 0
         ai_wrote = 0
         ai_errors = 0
+        triage_skipped = 0
+
+        # 分诊：预加载技术支持部成员列表
+        triage_cfg = cfg().get("triage") or {}
+        triage_enabled = triage_cfg.get("enabled", False)
+        triage_status_id = triage_cfg.get("status_id", 19)
+        triage_group_id = triage_cfg.get("group_id", 1137)
+        notify_cfg = cfg().get("notify") or {}
+        triage_webhook = triage_cfg.get("notify_webhook") or notify_cfg.get("dingtalk_webhook", "")
+        triage_secret = triage_cfg.get("notify_secret") or notify_cfg.get("dingtalk_secret", "")
+        group_member_ids: set[int] = set()
+        if triage_enabled and triage_webhook:
+            group_member_ids = db.get_group_member_ids(triage_group_id)
+
         # 延迟 import 避免循环
         from .pipeline import ingest_new_issue
         for it in rows:
@@ -274,6 +289,43 @@ def run_once(max_items: int | None = None) -> dict:
                 continue
             if tracker_whitelist and it.get("tracker_id") not in tracker_whitelist:
                 continue
+
+            # === 分诊：检测已与研发沟通的案件，跳过 AI 并推送钉钉 ===
+            if (
+                triage_enabled
+                and group_member_ids
+                and it.get("status_id") == triage_status_id
+                and it.get("assigned_to_id") in group_member_ids
+            ):
+                iid = it["id"]
+                jrows = journals_by_id.get(iid, [])
+                has_signal, keywords = detect_r_and_d_communication(
+                    _build_journals_for_cleaner(jrows)
+                )
+                if has_signal:
+                    triage_skipped += 1
+                    # 旁路通知钉钉：issue 摘要 + 匹配关键词（不跳过 AI）
+                    subj = it.get("subject") or ""
+                    kw_str = "、".join(keywords[:5])
+                    md = (
+                        f"### 案件已与研发沟通\n\n"
+                        f"- **案件号**: #{iid}\n"
+                        f"- **标题**: {subj}\n"
+                        f"- **匹配关键词**: {kw_str}\n"
+                        f"- **状态**: 支持部受理\n\n"
+                        f"> 系统检测到该案件 journal 中已有研发沟通记录，"
+                        f"AI 相似案卷检索仍会照常执行。"
+                    )
+                    try:
+                        post_dingtalk(
+                            triage_webhook, triage_secret,
+                            f"案件 #{iid} 已与研发沟通", md,
+                        )
+                    except Exception:
+                        import traceback as _tb
+                        _tb.print_exc()
+                    # 注意：不 continue，继续走 AI pipeline
+
             try:
                 res = ingest_new_issue(it["id"])
                 ai_triggered += 1
@@ -295,6 +347,7 @@ def run_once(max_items: int | None = None) -> dict:
         new_state["last_run_ai_triggered"] = ai_triggered
         new_state["last_run_ai_wrote"] = ai_wrote
         new_state["last_run_ai_errors"] = ai_errors
+        new_state["last_run_triage_skipped"] = triage_skipped
         _save_state(new_state)
 
         return {
@@ -304,6 +357,7 @@ def run_once(max_items: int | None = None) -> dict:
             "ai_triggered": ai_triggered,
             "ai_wrote": ai_wrote,
             "ai_errors": ai_errors,
+            "triage_skipped": triage_skipped,
             "since": last_str,
             "new_last_sync_at": new_state["last_sync_at"],
             "elapsed_ms": int((time.time() - t0) * 1000),
