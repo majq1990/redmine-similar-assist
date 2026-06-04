@@ -1,0 +1,78 @@
+# redmine-similar-assist 配置模板
+# 拷贝为 config.yaml 并填入真实 key 后再启动
+
+redmine:
+  base_url: "https://faq.egova.com.cn:7787"
+  api_key: "TODO_AI_ASSISTANT_API_KEY"       # 建议新建 ai-assistant 账号，避免和你本人发言混淆
+  verify_ssl: false                            # 与 reference_redmine_mcp.md 保持一致
+  ai_user_id: 49                               # 仅作记录用：当前 key 对应的 Redmine user id
+
+# 项目白名单（两种模式可叠加）
+target_projects: []              # 列举的 project_id
+target_project_root_id: null     # 给一个 root，自动含全部子孙
+target_project_cache_ttl_sec: 600
+
+# Embedding：SiliconFlow bge-m3
+embedding:
+  endpoint: "https://api.siliconflow.cn/v1/embeddings"
+  api_key: "TODO_SILICONFLOW_API_KEY"
+  model: "BAAI/bge-m3"
+  dim: 1024
+  batch_size: 16
+
+# LLM：DeepSeek
+llm:
+  endpoint: "https://api.deepseek.com/v1/chat/completions"
+  api_key: "TODO_DEEPSEEK_API_KEY"
+  # 必须用 deepseek-v4-flash（便宜款）；严禁换 deepseek-v4-pro
+  model: "deepseek-v4-flash"
+  temperature: 0.1
+  max_tokens: 800
+
+# 相似度阈值与召回参数
+recall:
+  knn_top: 20            # 向量召回先取这么多
+  min_cosine: 0.65       # 低于这个直接丢
+  llm_filter_top: 5      # 送给 LLM 精排的最大数量
+  final_top: 3           # 最终写入 issue 的条数上限
+
+# Webhook 服务
+webhook:
+  host: "0.0.0.0"
+  port: 8765
+  shared_secret: "TODO_RANDOM_SECRET"   # redmine_webhooks 插件里 Custom Header 配同样的值
+  header_name: "X-Webhook-Secret"
+
+# 数据落地
+storage:
+  vector_db: "data/vectors.db"
+  log_db: "data/assist_log.db"
+  sync_state: "data/sync_state.json"
+
+# Redmine MySQL 直连（backfill 与 sync 用）
+redmine_db:
+  host: "TODO_DB_HOST"
+  port: 13306
+  database: "redmine"
+  user: "redmine"
+  password: "TODO_DB_PASSWORD"
+  charset: "utf8mb4"
+  sync_batch_size: 5000
+  backfill_page_size: 500
+
+sync:
+  interval_minutes: 15
+  lock_file: "data/sync.lock"
+
+# 每日统计推送（cron 工作日 18:00 触发 src/daily_stats.py）
+notify:
+  # 钉钉自定义机器人 webhook（含 access_token=xxx）
+  dingtalk_webhook: "TODO_DINGTALK_WEBHOOK"
+  # 钉钉加签 secret（SEC 开头）
+  dingtalk_secret: "TODO_DINGTALK_SECRET"
+
+# 回写策略
+write_back:
+  enabled: false              # 阶段 1 先 false，只生成不真写；验证 OK 再改 true
+  note_header: "🤖 AI 智能助理建议（仅供参考，请人工判断）"
+  note_footer: "*以上由 AI 自动检索历史案卷生成。如有错漏请忽略。*"

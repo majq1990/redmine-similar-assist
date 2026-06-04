@@ -1,0 +1,14 @@
+config.yaml
+data/
+!data/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log
+# IDE
+.vscode/
+.idea/
+# OS
+.DS_Store
+Thumbs.db
