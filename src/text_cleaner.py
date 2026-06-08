@@ -85,27 +85,104 @@ def detect_r_and_d_communication(journals: list[dict]) -> tuple[bool, list[str]]
         has_signal: True 表示已与研发沟通过，应跳过 AI 分析
         matched_keywords: 命中的关键词列表（用于通知文案）
     """
-    # 研发相关关键词（出现任一即认为已沟通）
-    PATTERNS = [
-        # 直接提到研发
-        "研发", "开发", "RD", "技术部", "研发部", "研发同事",
-        # 补提/已处理
-        "补提", "已补提", "已处理", "已解决", "已修复",
+    # ---- 排除模式：匹配到这些表示是"请求研发帮助"而非"研发已处理" ----
+    EXCLUDE_PATTERNS = [
+        "需研发", "请研发", "需要研发", "研发支持",
+        "研发配合", "研发协助", "研发处理", "研发排查",
+    ]
+
+    # ---- 肯定式关键词：出现任一即认为研发已沟通过 ----
+    AFFIRM_PATTERNS = [
+        # 研发已完成/确认（"研发已" 是最核心的信号）
+        "研发已", "研发确认", "研发回复", "研发反馈",
+        "研发回复已", "研发反馈已", "研发处理完成",
+        # 补提
+        "已补提", "已提单", "补提",
         # 沟通确认
         "已沟通", "已确认", "已反馈", "已告知", "已对接",
         # 状态类
+        "已处理", "已解决", "已修复", "已修改",
         "重复问题", "已知问题", "非bug", "非缺陷", "设计如此",
     ]
+
     matched = []
+    excluded = []
     for j in journals:
         notes_raw = j.get("notes") or ""
         notes_text = clean_html(notes_raw)
         if not notes_text:
             continue
-        for kw in PATTERNS:
+        # 先检查排除模式
+        for ep in EXCLUDE_PATTERNS:
+            if ep in notes_text and ep not in excluded:
+                excluded.append(ep)
+        # 再检查肯定式模式
+        for kw in AFFIRM_PATTERNS:
             if kw in notes_text and kw not in matched:
                 matched.append(kw)
+
+    # 如果同时命中排除模式和肯定模式，需要进一步判断
+    # 排除模式优先：如果一个 journal 同时包含"需研发"和"研发已"，
+    # "研发已"才是真正的处理证据；但如果只有"需研发"没有肯定式，则排除
+    if matched and excluded:
+        # 有肯定式证据存在，不排除
+        pass
+    elif excluded and not matched:
+        # 只有排除模式，没有肯定式 → 不触发
+        return False, []
+
     return bool(matched), matched
+
+
+# ============ 处理路径已确认：代码迁移 / 发更新包 ============
+# 这类案件研发/区域已给出明确处理方式（按 wiki 取包更新、组件迁移到项目分支等），
+# 落到支持部时本质是"照单执行"，需要主动通知支持部群。
+_MIGRATION_PATTERNS = [
+    "代码迁移", "组件迁移", "迁移组件", "迁移代码", "迁移到", "迁移分支",
+    "迁移一下", "迁分支", "迁到", "合并到分支", "合并分支", "合并代码",
+    "代码合并", "cherry-pick", "cherrypick", "迁移升级", "迁移组件升级",
+]
+_PACKAGE_PATTERNS = [
+    "更新包", "升级包", "补丁包", "全量包", "增量包",
+    "发更新包", "发布更新包", "提供更新包", "发下更新包", "发下更新",
+    "发包", "发版", "出包", "出更新包", "发下包", "发个包", "打个包",
+    "请发包", "给测试发包", "请给测试发包", "发下最新版", "最新版更新包",
+]
+
+
+def detect_confirmed_handling_path(
+    subject: str, description_html: str | None, journals: list[dict]
+) -> tuple[bool, list[str], list[str]]:
+    """检测案件是否属于"处理路径已明确"类型：代码迁移 / 发更新包。
+
+    扫描 标题 + 描述 + journal notes 的纯文本。这类案件区域/研发已给出
+    确定的处理方式，落到支持部就是照单执行，应主动通知支持部群。
+
+    Returns:
+        (has_signal, matched_keywords, path_types)
+        path_types ⊆ {"代码迁移", "发更新包"}
+    """
+    blob_parts = [subject or "", clean_html(description_html)]
+    for j in journals:
+        blob_parts.append(clean_html(j.get("notes") or ""))
+    blob = " ".join(p for p in blob_parts if p)
+    if not blob:
+        return False, [], []
+
+    matched: list[str] = []
+    types: list[str] = []
+    for kw in _MIGRATION_PATTERNS:
+        if kw in blob and kw not in matched:
+            matched.append(kw)
+            if "代码迁移" not in types:
+                types.append("代码迁移")
+    for kw in _PACKAGE_PATTERNS:
+        if kw in blob and kw not in matched:
+            matched.append(kw)
+            if "发更新包" not in types:
+                types.append("发更新包")
+
+    return bool(matched), matched, types
 
 
 def find_resolution_notes(journals: list[dict]) -> str:
