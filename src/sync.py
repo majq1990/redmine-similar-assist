@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -31,7 +32,12 @@ from .config import (
 from .db_client import RedmineDB
 from .embedder import Embedder
 from .notify import post_dingtalk
-from .text_cleaner import build_issue_text, detect_r_and_d_communication, find_resolution_notes
+from .text_cleaner import (
+    build_issue_text,
+    detect_confirmed_handling_path,
+    detect_r_and_d_communication,
+    find_resolution_notes,
+)
 from .vector_store import VectorStore, get_vector_store
 
 
@@ -172,6 +178,157 @@ class _FileLock:
         self.release()
 
 
+def _triage_log_conn() -> sqlite3.Connection:
+    """分诊去重表（与 assist_log 同库）：每案每类只通知一次。"""
+    path = project_root() / cfg()["storage"]["log_db"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS triage_log(
+              issue_id    INTEGER,
+              triage_type TEXT,
+              notified_at TEXT,
+              keywords    TEXT,
+              PRIMARY KEY(issue_id, triage_type)
+           )"""
+    )
+    conn.commit()
+    return conn
+
+
+def _triage_already(conn: sqlite3.Connection, issue_id: int, ttype: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM triage_log WHERE issue_id=? AND triage_type=?",
+            (issue_id, ttype),
+        ).fetchone()
+        is not None
+    )
+
+
+def _triage_mark(conn: sqlite3.Connection, issue_id: int, ttype: str, keywords: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO triage_log(issue_id, triage_type, notified_at, keywords) "
+        "VALUES(?,?,?,?)",
+        (issue_id, ttype, time.strftime("%Y-%m-%dT%H:%M:%S"), keywords),
+    )
+    conn.commit()
+
+
+def _triage_post(
+    webhook: str, secret: str, keyword: str, title: str, md: str
+) -> dict:
+    """推送钉钉并 @全体；自动保证机器人关键字命中（校验 title+text）。"""
+    if keyword and keyword not in title and keyword not in md:
+        md = md + f"\n\n> （本通知含关键字「{keyword}」）"
+    return post_dingtalk(webhook, secret, title, md, at_all=True)
+
+
+def run_triage(rows: list[dict], journals_by_id: dict, db: RedmineDB) -> dict:
+    """对流转到「支持部受理(status=19)」且派给技术支持部的案件做分诊推送。
+
+    两类信号（各自独立去重，互不影响）：
+      - rnd_comm: journal 已有研发沟通记录
+      - confirmed_path: 标题/描述/journal 明确「代码迁移 / 发更新包」，处理路径已确认
+
+    触发点是「流转到 status=19 + assigned 给支持部群组(或其成员)」，
+    不再局限于"新建那一刻"；triage_log 保证每案每类只通知一次。
+    """
+    triage_cfg = cfg().get("triage") or {}
+    if not triage_cfg.get("enabled", False):
+        return {"rnd": 0, "path": 0, "enabled": False}
+    notify_cfg = cfg().get("notify") or {}
+    webhook = triage_cfg.get("notify_webhook") or notify_cfg.get("dingtalk_webhook", "")
+    secret = triage_cfg.get("notify_secret") or notify_cfg.get("dingtalk_secret", "")
+    # 关键字优先用 triage 专属（独立机器人时），否则回退 notify 机器人的关键字
+    keyword = triage_cfg.get("notify_keyword") or notify_cfg.get("dingtalk_keyword", "")
+    if not webhook:
+        return {"rnd": 0, "path": 0, "no_webhook": True}
+
+    status_id = triage_cfg.get("status_id", 19)
+    group_id = triage_cfg.get("group_id", 1137)
+    members = db.get_group_member_ids(group_id)
+    # 群组待认领（assigned==group_id）或已被成员认领（assigned in members）都算落到支持部
+    valid_assignees = set(members) | {group_id}
+    tracker_whitelist = set(cfg().get("tracker_whitelist") or [])
+    base = cfg()["redmine"]["base_url"].rstrip("/")
+
+    conn = _triage_log_conn()
+    rnd_n = 0
+    path_n = 0
+    try:
+        for it in rows:
+            if it.get("status_id") != status_id:
+                continue
+            if it.get("assigned_to_id") not in valid_assignees:
+                continue
+            if not is_project_targeted(it.get("project_id")):
+                continue
+            if tracker_whitelist and it.get("tracker_id") not in tracker_whitelist:
+                continue
+
+            iid = it["id"]
+            subject = it.get("subject") or ""
+            desc = it.get("description") or ""
+            cj = _build_journals_for_cleaner(journals_by_id.get(iid, []))
+
+            # 1) 已与研发沟通
+            if not _triage_already(conn, iid, "rnd_comm"):
+                has, kws = detect_r_and_d_communication(cj)
+                if has:
+                    kw_str = "、".join(kws[:5])
+                    md = (
+                        f"### 案件已与研发沟通\n\n"
+                        f"- **案件号**: #{iid}\n"
+                        f"- **标题**: {subject}\n"
+                        f"- **匹配关键词**: {kw_str}\n"
+                        f"- **状态**: 支持部受理\n"
+                        f"- **链接**: {base}/issues/{iid}\n\n"
+                        f"> 系统检测到该案件 journal 中已有研发沟通记录，请支持部按沟通结论跟进。"
+                    )
+                    try:
+                        _triage_post(
+                            webhook, secret, keyword,
+                            f"案件 #{iid} 已与研发沟通", md,
+                        )
+                        _triage_mark(conn, iid, "rnd_comm", kw_str)
+                        rnd_n += 1
+                    except Exception:
+                        import traceback as _tb
+                        _tb.print_exc()
+
+            # 2) 处理路径已明确：代码迁移 / 发更新包
+            if not _triage_already(conn, iid, "confirmed_path"):
+                has2, kws2, types = detect_confirmed_handling_path(subject, desc, cj)
+                if has2:
+                    kw_str = "、".join(kws2[:6])
+                    type_str = "/".join(types)
+                    md = (
+                        f"### 案件处理路径已明确（{type_str}）\n\n"
+                        f"- **案件号**: #{iid}\n"
+                        f"- **标题**: {subject}\n"
+                        f"- **类型**: {type_str}\n"
+                        f"- **匹配关键词**: {kw_str}\n"
+                        f"- **状态**: 支持部受理\n"
+                        f"- **链接**: {base}/issues/{iid}\n\n"
+                        f"> 该案件处理方式已确认（按 wiki 取包更新 / 组件迁移到项目分支等），"
+                        f"请支持部安排执行。"
+                    )
+                    try:
+                        _triage_post(
+                            webhook, secret, keyword,
+                            f"案件 #{iid} 处理路径已明确（{type_str}）", md,
+                        )
+                        _triage_mark(conn, iid, "confirmed_path", kw_str)
+                        path_n += 1
+                    except Exception:
+                        import traceback as _tb
+                        _tb.print_exc()
+    finally:
+        conn.close()
+    return {"rnd": rnd_n, "path": path_n}
+
+
 def run_once(max_items: int | None = None) -> dict:
     """增量同步一次。返回统计字典。"""
     c = cfg()
@@ -266,20 +423,8 @@ def run_once(max_items: int | None = None) -> dict:
         ai_triggered = 0
         ai_wrote = 0
         ai_errors = 0
-        triage_skipped = 0
 
-        # 分诊：预加载技术支持部成员列表
-        triage_cfg = cfg().get("triage") or {}
-        triage_enabled = triage_cfg.get("enabled", False)
-        triage_status_id = triage_cfg.get("status_id", 19)
-        triage_group_id = triage_cfg.get("group_id", 1137)
-        notify_cfg = cfg().get("notify") or {}
-        triage_webhook = triage_cfg.get("notify_webhook") or notify_cfg.get("dingtalk_webhook", "")
-        triage_secret = triage_cfg.get("notify_secret") or notify_cfg.get("dingtalk_secret", "")
-        group_member_ids: set[int] = set()
-        if triage_enabled and triage_webhook:
-            group_member_ids = db.get_group_member_ids(triage_group_id)
-
+        # === 新建工单检测 + AI 写回（仅对本窗口内新建的案件）===
         # 延迟 import 避免循环
         from .pipeline import ingest_new_issue
         for it in rows:
@@ -289,43 +434,6 @@ def run_once(max_items: int | None = None) -> dict:
                 continue
             if tracker_whitelist and it.get("tracker_id") not in tracker_whitelist:
                 continue
-
-            # === 分诊：检测已与研发沟通的案件，跳过 AI 并推送钉钉 ===
-            if (
-                triage_enabled
-                and group_member_ids
-                and it.get("status_id") == triage_status_id
-                and it.get("assigned_to_id") in group_member_ids
-            ):
-                iid = it["id"]
-                jrows = journals_by_id.get(iid, [])
-                has_signal, keywords = detect_r_and_d_communication(
-                    _build_journals_for_cleaner(jrows)
-                )
-                if has_signal:
-                    triage_skipped += 1
-                    # 旁路通知钉钉：issue 摘要 + 匹配关键词（不跳过 AI）
-                    subj = it.get("subject") or ""
-                    kw_str = "、".join(keywords[:5])
-                    md = (
-                        f"### 案件已与研发沟通\n\n"
-                        f"- **案件号**: #{iid}\n"
-                        f"- **标题**: {subj}\n"
-                        f"- **匹配关键词**: {kw_str}\n"
-                        f"- **状态**: 支持部受理\n\n"
-                        f"> 系统检测到该案件 journal 中已有研发沟通记录，"
-                        f"AI 相似案卷检索仍会照常执行。"
-                    )
-                    try:
-                        post_dingtalk(
-                            triage_webhook, triage_secret,
-                            f"案件 #{iid} 已与研发沟通", md,
-                        )
-                    except Exception:
-                        import traceback as _tb
-                        _tb.print_exc()
-                    # 注意：不 continue，继续走 AI pipeline
-
             try:
                 res = ingest_new_issue(it["id"])
                 ai_triggered += 1
@@ -336,6 +444,11 @@ def run_once(max_items: int | None = None) -> dict:
                 # 不打断后续条目
                 import traceback as _tb
                 _tb.print_exc()
+
+        # === 分诊：对流转到「支持部受理」的案件推送钉钉（独立于新建逻辑，自带去重）===
+        # 两类：研发已沟通 / 处理路径已明确(代码迁移·发更新包)
+        triage_res = run_triage(rows, journals_by_id, db)
+        triage_skipped = triage_res.get("rnd", 0) + triage_res.get("path", 0)
 
         # 更新 state（向前推 1 秒避免边界重复扫同一条）
         new_state = dict(state)
@@ -348,6 +461,8 @@ def run_once(max_items: int | None = None) -> dict:
         new_state["last_run_ai_wrote"] = ai_wrote
         new_state["last_run_ai_errors"] = ai_errors
         new_state["last_run_triage_skipped"] = triage_skipped
+        new_state["last_run_triage_rnd"] = triage_res.get("rnd", 0)
+        new_state["last_run_triage_path"] = triage_res.get("path", 0)
         _save_state(new_state)
 
         return {
@@ -358,6 +473,8 @@ def run_once(max_items: int | None = None) -> dict:
             "ai_wrote": ai_wrote,
             "ai_errors": ai_errors,
             "triage_skipped": triage_skipped,
+            "triage_rnd": triage_res.get("rnd", 0),
+            "triage_path": triage_res.get("path", 0),
             "since": last_str,
             "new_last_sync_at": new_state["last_sync_at"],
             "elapsed_ms": int((time.time() - t0) * 1000),

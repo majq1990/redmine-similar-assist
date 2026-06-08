@@ -12,3 +12,5 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+# OMC 编排状态
+.omc/

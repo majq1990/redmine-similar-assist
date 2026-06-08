@@ -71,14 +71,22 @@ notify:
   # 钉钉加签 secret（SEC 开头）
   dingtalk_secret: "TODO_DINGTALK_SECRET"
 
-# 分诊：对"支持部受理"案件检测是否已与研发沟通，推送钉钉通知（旁路，不跳过 AI）
+# 分诊：案件流转到"支持部受理"且派给技术支持部(群组或成员)时，推送钉钉通知。
+# 旁路，不影响 AI 相似检索；triage_log 表保证每案每类只通知一次。
+# 两类信号：
+#   - rnd_comm:       journal 已有研发沟通记录（detect_r_and_d_communication）
+#   - confirmed_path: 标题/描述/journal 明确"代码迁移 / 发更新包"，处理路径已确认
+#                     （detect_confirmed_handling_path）
 triage:
   enabled: false
   status_id: 19               # 支持部受理
-  group_id: 1137              # 技术支持部
-  # 留空则复用 notify.dingtalk_webhook / notify.dingtalk_secret
+  group_id: 1137              # 技术支持部（assigned 为群组 id 或其成员 id 都算落到支持部）
+  # 专用机器人；留空则复用 notify.dingtalk_webhook / notify.dingtalk_secret
+  # 关键字优先用 notify_keyword，否则回退 notify.dingtalk_keyword，会自动注入消息体过校验
+  # 分诊通知默认 @全体群成员（isAtAll）
   notify_webhook: ""
   notify_secret: ""
+  notify_keyword: ""
 
 # 回写策略
 write_back:

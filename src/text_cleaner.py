@@ -134,6 +134,57 @@ def detect_r_and_d_communication(journals: list[dict]) -> tuple[bool, list[str]]
     return bool(matched), matched
 
 
+# ============ 处理路径已确认：代码迁移 / 发更新包 ============
+# 这类案件研发/区域已给出明确处理方式（按 wiki 取包更新、组件迁移到项目分支等），
+# 落到支持部时本质是"照单执行"，需要主动通知支持部群。
+_MIGRATION_PATTERNS = [
+    "代码迁移", "组件迁移", "迁移组件", "迁移代码", "迁移到", "迁移分支",
+    "迁移一下", "迁分支", "迁到", "合并到分支", "合并分支", "合并代码",
+    "代码合并", "cherry-pick", "cherrypick", "迁移升级", "迁移组件升级",
+]
+_PACKAGE_PATTERNS = [
+    "更新包", "升级包", "补丁包", "全量包", "增量包",
+    "发更新包", "发布更新包", "提供更新包", "发下更新包", "发下更新",
+    "发包", "发版", "出包", "出更新包", "发下包", "发个包", "打个包",
+    "请发包", "给测试发包", "请给测试发包", "发下最新版", "最新版更新包",
+]
+
+
+def detect_confirmed_handling_path(
+    subject: str, description_html: str | None, journals: list[dict]
+) -> tuple[bool, list[str], list[str]]:
+    """检测案件是否属于"处理路径已明确"类型：代码迁移 / 发更新包。
+
+    扫描 标题 + 描述 + journal notes 的纯文本。这类案件区域/研发已给出
+    确定的处理方式，落到支持部就是照单执行，应主动通知支持部群。
+
+    Returns:
+        (has_signal, matched_keywords, path_types)
+        path_types ⊆ {"代码迁移", "发更新包"}
+    """
+    blob_parts = [subject or "", clean_html(description_html)]
+    for j in journals:
+        blob_parts.append(clean_html(j.get("notes") or ""))
+    blob = " ".join(p for p in blob_parts if p)
+    if not blob:
+        return False, [], []
+
+    matched: list[str] = []
+    types: list[str] = []
+    for kw in _MIGRATION_PATTERNS:
+        if kw in blob and kw not in matched:
+            matched.append(kw)
+            if "代码迁移" not in types:
+                types.append("代码迁移")
+    for kw in _PACKAGE_PATTERNS:
+        if kw in blob and kw not in matched:
+            matched.append(kw)
+            if "发更新包" not in types:
+                types.append("发更新包")
+
+    return bool(matched), matched, types
+
+
 def find_resolution_notes(journals: list[dict]) -> str:
     """从 journals 里挑解决方案候选：
 
