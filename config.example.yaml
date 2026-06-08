@@ -81,10 +81,12 @@ triage:
   enabled: false
   status_id: 19               # 支持部受理
   group_id: 1137              # 技术支持部（assigned 为群组 id 或其成员 id 都算落到支持部）
-  # 留空则复用 notify.dingtalk_webhook / notify.dingtalk_secret
-  # 注意：复用 notify 机器人时会自动把 notify.dingtalk_keyword 注入消息体以通过关键字校验
+  # 专用机器人；留空则复用 notify.dingtalk_webhook / notify.dingtalk_secret
+  # 关键字优先用 notify_keyword，否则回退 notify.dingtalk_keyword，会自动注入消息体过校验
+  # 分诊通知默认 @全体群成员（isAtAll）
   notify_webhook: ""
   notify_secret: ""
+  notify_keyword: ""
 
 # 回写策略
 write_back:

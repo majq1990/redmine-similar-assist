@@ -24,7 +24,13 @@ def sign_dingtalk(secret: str) -> tuple[str, str]:
     return ts, sign
 
 
-def post_dingtalk(webhook: str, secret: str | None, title: str, markdown: str) -> dict:
+def post_dingtalk(
+    webhook: str,
+    secret: str | None,
+    title: str,
+    markdown: str,
+    at_all: bool = False,
+) -> dict:
     """发送钉钉 markdown 消息。
 
     Args:
@@ -32,6 +38,7 @@ def post_dingtalk(webhook: str, secret: str | None, title: str, markdown: str) -
         secret: 加签 secret（SEC 开头），为空则不加签
         title: 消息标题
         markdown: markdown 正文
+        at_all: True 则 @全体群成员（isAtAll）
 
     Returns:
         钉钉 API 响应 dict
@@ -41,9 +48,13 @@ def post_dingtalk(webhook: str, secret: str | None, title: str, markdown: str) -
         ts, sign = sign_dingtalk(secret)
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}timestamp={ts}&sign={sign}"
+    if at_all:
+        # @全体时正文带上 @所有人 字样，配合 isAtAll 才会高亮提醒
+        markdown = markdown + "\n\n@所有人"
     payload = {
         "msgtype": "markdown",
         "markdown": {"title": title, "text": markdown},
+        "at": {"isAtAll": bool(at_all)},
     }
     r = requests.post(
         url, json=payload, timeout=15, headers={"Content-Type": "application/json"}

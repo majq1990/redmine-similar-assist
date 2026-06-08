@@ -218,10 +218,10 @@ def _triage_mark(conn: sqlite3.Connection, issue_id: int, ttype: str, keywords: 
 def _triage_post(
     webhook: str, secret: str, keyword: str, title: str, md: str
 ) -> dict:
-    """推送钉钉，自动保证机器人关键字命中（校验 title+text）。"""
+    """推送钉钉并 @全体；自动保证机器人关键字命中（校验 title+text）。"""
     if keyword and keyword not in title and keyword not in md:
-        md = md + f"\n\n> （本通知经「{keyword}」机器人通道推送）"
-    return post_dingtalk(webhook, secret, title, md)
+        md = md + f"\n\n> （本通知含关键字「{keyword}」）"
+    return post_dingtalk(webhook, secret, title, md, at_all=True)
 
 
 def run_triage(rows: list[dict], journals_by_id: dict, db: RedmineDB) -> dict:
@@ -240,7 +240,8 @@ def run_triage(rows: list[dict], journals_by_id: dict, db: RedmineDB) -> dict:
     notify_cfg = cfg().get("notify") or {}
     webhook = triage_cfg.get("notify_webhook") or notify_cfg.get("dingtalk_webhook", "")
     secret = triage_cfg.get("notify_secret") or notify_cfg.get("dingtalk_secret", "")
-    keyword = notify_cfg.get("dingtalk_keyword", "")
+    # 关键字优先用 triage 专属（独立机器人时），否则回退 notify 机器人的关键字
+    keyword = triage_cfg.get("notify_keyword") or notify_cfg.get("dingtalk_keyword", "")
     if not webhook:
         return {"rnd": 0, "path": 0, "no_webhook": True}
 
