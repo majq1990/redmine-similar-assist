@@ -15,18 +15,32 @@ from flask import Flask, jsonify, request
 from .config import cfg, is_project_targeted
 from .pipeline import ingest_new_issue
 from . import sync as sync_module
-from .vector_store import get_vector_store
+from .vector_store import get_vector_store, get_doc_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("webhook")
 
 app = Flask(__name__)
 
-# 启动时预热 VectorStore 单例：把 168k 向量 sqlite-vec → faiss 内存索引
-# 避免首个真实请求被卡 30+ 秒。Flask 模块 import 时执行一次。
-log.info("warming up VectorStore (loading 168k faiss from sqlite-vec, ~30s)...")
-get_vector_store()
-log.info("VectorStore ready")
+# 预热放到后台线程：消除冷启动空窗。
+# 16.8w 向量 sqlite-vec → faiss 加载 ~7min，期间 Flask 端口立即可用（health 通），
+# 但 KNN 尚未就绪——sync/webhook 在未就绪时直接跳过（不推进 state，恢复后自动补扫）。
+# 只有这个后台线程会创建单例，请求路径用 _ready 守门，避免并发重复加载（单例非线程安全）。
+_ready = threading.Event()
+
+
+def _warmup() -> None:
+    log.info("warming up VectorStore + DocStore in background (faiss load ~7min)...")
+    try:
+        get_vector_store()
+        get_doc_store()
+        _ready.set()
+        log.info("VectorStore + DocStore ready")
+    except Exception:
+        log.exception("warmup failed")
+
+
+threading.Thread(target=_warmup, daemon=True).start()
 
 
 def _check_secret(req) -> bool:
@@ -39,6 +53,10 @@ def _check_secret(req) -> bool:
 
 
 def _process_async(issue_id: int) -> None:
+    if not _ready.is_set():
+        # 向量未就绪，跳过；DB 轮询 sync 就绪后会补处理该新建工单
+        log.info("skip webhook ingest %s: warming up", issue_id)
+        return
     try:
         res = ingest_new_issue(issue_id)
         log.info("processed %s -> %s", issue_id, res.get("wrote"))
@@ -75,7 +93,8 @@ def hook():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    # 始终 200（容器/反代视为存活）；ready 标记向量索引是否加载完
+    return jsonify({"ok": True, "ready": _ready.is_set()})
 
 
 @app.post("/sync/incremental")
@@ -91,6 +110,9 @@ def sync_incremental():
     expected = (c.get("sync_secret") or "").strip()
     if expected and request.headers.get(c.get("header_name", "X-Webhook-Secret")) != expected:
         return jsonify({"error": "bad sync secret"}), 401
+    if not _ready.is_set():
+        # 向量索引还在后台加载，跳过本次（不推进 last_sync_at，就绪后下次自动补扫）
+        return jsonify({"skipped": "warming_up", "ready": False}), 200
     body = request.get_json(silent=True) or {}
     max_items = body.get("max")
     try:
