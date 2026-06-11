@@ -35,9 +35,16 @@ def _embed_text_hash(embed_text: str) -> str:
 
 
 def _build_journals_for_cleaner(rows: list[dict], status_map: dict) -> list[dict]:
-    """把 db_client 拉的 journal dict 转成 text_cleaner.find_resolution_notes 期望的格式。"""
+    """把 db_client 拉的 journal dict 转成 text_cleaner.find_resolution_notes 期望的格式。
+
+    屏蔽 AI 写回账号(egova-gczx)的楼——避免 AI 自己写的内容回流污染 resolution 抽取。
+    """
+    from .config import cfg as _cfg
+    ai_user_id = (_cfg().get("redmine") or {}).get("ai_user_id")
     out = []
     for r in rows:
+        if ai_user_id and r.get("user_id") == ai_user_id:
+            continue
         j = {"notes": r["notes"] or ""}
         if r.get("status_changed_to_id"):
             j["details"] = [

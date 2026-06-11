@@ -77,8 +77,16 @@ def _parse_ts(s: str) -> dt.datetime:
 
 
 def _build_journals_for_cleaner(rows: list[dict]) -> list[dict]:
+    """转换 db journal → cleaner 期望格式，同时屏蔽 AI 写回账号(egova-gczx)的楼。
+
+    AI 自己写的"相似案件建议/处理路径已明确/已检索暂无推荐"如果回流到分析路径，
+    会污染 resolution 抽取、研发沟通检测、处理路径检测——故在最上游一次性过滤。
+    """
+    ai_user_id = (cfg().get("redmine") or {}).get("ai_user_id")
     out = []
     for r in rows:
+        if ai_user_id and r.get("user_id") == ai_user_id:
+            continue  # 屏蔽 AI 自己写的楼
         j = {"notes": r["notes"] or ""}
         if r.get("status_changed_to_id"):
             j["details"] = [

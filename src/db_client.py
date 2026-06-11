@@ -165,15 +165,17 @@ class RedmineDB:
     def fetch_journals_bulk(self, issue_ids: list[int]) -> dict[int, list[dict]]:
         """一次性拉一批 issue 的全部 journals + journal_details。
 
-        返回 {issue_id: [{id, notes, created_on, status_changed_to_id}]}
+        返回 {issue_id: [{id, notes, user_id, created_on, status_changed_to_id}]}
         status_changed_to_id 通过 join journal_details 拼出（property='attr' AND prop_key='status_id'）
+        user_id 用于上层过滤掉 AI 写回账号（egova-gczx）的楼，避免污染分析。
         """
         if not issue_ids:
             return {}
         with self._conn() as (_, cur):
             placeholders = ",".join("%s" for _ in issue_ids)
             cur.execute(
-                f"""SELECT j.id, j.journalized_id AS issue_id, j.notes, j.created_on,
+                f"""SELECT j.id, j.journalized_id AS issue_id, j.notes,
+                          j.user_id, j.created_on,
                           MAX(CASE WHEN d.property='attr' AND d.prop_key='status_id'
                                    THEN d.value END) AS status_changed_to_id
                      FROM journals j
@@ -191,6 +193,7 @@ class RedmineDB:
                     {
                         "id": r["id"],
                         "notes": r["notes"] or "",
+                        "user_id": r.get("user_id"),
                         "created_on": r["created_on"],
                         "status_changed_to_id": (
                             int(r["status_changed_to_id"])
