@@ -428,8 +428,12 @@ def run_once(max_items: int | None = None) -> dict:
         # 批量 embed
         if expensive_texts:
             embs = em.embed(expensive_texts)
-            for emb, m in zip(embs, expensive_metas):
-                vs.upsert(m["issue_id"], emb, m)
+            vs.upsert_many(
+                [
+                    (m["issue_id"], emb, m)
+                    for emb, m in zip(embs, expensive_metas)
+                ]
+            )
 
         # === 新建工单检测 + AI 写回 ===
         # 判断条件：created_on > since 且通过 project/tracker 白名单

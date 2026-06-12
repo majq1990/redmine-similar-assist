@@ -125,8 +125,9 @@ def _process_chunk(
 
     # 批量 embed
     embs = em.embed(texts)
-    for emb, m in zip(embs, metas):
-        vs.upsert(m["issue_id"], emb, m)
+    vs.upsert_many(
+        [(m["issue_id"], emb, m) for emb, m in zip(embs, metas)]
+    )
     return len(chunk)
 
 

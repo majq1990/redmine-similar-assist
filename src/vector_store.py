@@ -109,44 +109,57 @@ class VectorStore:
         )
 
     def upsert(self, issue_id: int, embedding: list[float], meta: dict[str, Any]) -> None:
-        # sqlite-vec 持久化
+        self.upsert_many([(issue_id, embedding, meta)])
+
+    def upsert_many(
+        self, items: list[tuple[int, list[float], dict[str, Any]]]
+    ) -> None:
+        """批量持久化并更新 FAISS，只提交一次 SQLite 事务。"""
+        if not items:
+            return
+
         c = self.conn.cursor()
-        c.execute("DELETE FROM vec_issues WHERE rowid=?", (issue_id,))
-        c.execute(
-            "INSERT INTO vec_issues(rowid, embedding) VALUES(?, ?)",
-            (issue_id, _pack(embedding)),
-        )
-        c.execute(
-            """INSERT INTO issues_meta(issue_id, subject, status, closed_on, resolution, updated_on, embed_text_hash)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(issue_id) DO UPDATE SET
-                 subject=excluded.subject,
-                 status=excluded.status,
-                 closed_on=excluded.closed_on,
-                 resolution=excluded.resolution,
-                 updated_on=excluded.updated_on,
-                 embed_text_hash=excluded.embed_text_hash""",
-            (
-                issue_id,
-                meta.get("subject"),
-                meta.get("status"),
-                meta.get("closed_on"),
-                meta.get("resolution"),
-                meta.get("updated_on"),
-                meta.get("embed_text_hash"),
-            ),
-        )
+        for issue_id, embedding, meta in items:
+            c.execute("DELETE FROM vec_issues WHERE rowid=?", (issue_id,))
+            c.execute(
+                "INSERT INTO vec_issues(rowid, embedding) VALUES(?, ?)",
+                (issue_id, _pack(embedding)),
+            )
+            c.execute(
+                """INSERT INTO issues_meta(issue_id, subject, status, closed_on, resolution, updated_on, embed_text_hash)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(issue_id) DO UPDATE SET
+                     subject=excluded.subject,
+                     status=excluded.status,
+                     closed_on=excluded.closed_on,
+                     resolution=excluded.resolution,
+                     updated_on=excluded.updated_on,
+                     embed_text_hash=excluded.embed_text_hash""",
+                (
+                    issue_id,
+                    meta.get("subject"),
+                    meta.get("status"),
+                    meta.get("closed_on"),
+                    meta.get("resolution"),
+                    meta.get("updated_on"),
+                    meta.get("embed_text_hash"),
+                ),
+            )
         self.conn.commit()
 
-        # faiss 同步：remove + add
-        vec = _l2_normalize(np.asarray(embedding, dtype="float32"))
+        # FAISS 同步也批量执行，避免逐条 remove/add。
+        ids = np.array([item[0] for item in items], dtype="int64")
+        vecs = np.stack(
+            [
+                _l2_normalize(np.asarray(item[1], dtype="float32"))
+                for item in items
+            ]
+        ).astype("float32")
         try:
-            self._index.remove_ids(np.array([issue_id], dtype="int64"))
+            self._index.remove_ids(ids)
         except Exception:
-            pass  # 不存在就跳过
-        self._index.add_with_ids(
-            vec.reshape(1, -1), np.array([issue_id], dtype="int64")
-        )
+            pass
+        self._index.add_with_ids(vecs, ids)
 
     def has(self, issue_id: int) -> bool:
         row = self.conn.execute(
