@@ -26,6 +26,7 @@ _CSS_VAR_RE = re.compile(r"--[a-z][a-z0-9-]*:\s*[^;\"]+;?", re.IGNORECASE)
 _WS_RE = re.compile(r"\s+")
 _MAX_LEN = 4000
 _MAX_CODE_LEN = 400
+_MAX_FORM_RECORDS_LEN = 5000
 
 
 def clean_html(text: str | None) -> str:
@@ -71,6 +72,58 @@ def build_issue_text(subject: str, description_html: str) -> str:
     """主题 + 清洗后正文。用于 embedding。"""
     desc = clean_html(description_html)
     return f"[标题] {subject}\n[正文] {desc}"
+
+
+def build_form_records_text(
+    records: list[dict], max_len: int = _MAX_FORM_RECORDS_LEN
+) -> str:
+    """把 form_* 研发/测试操作记录整理成适合 embedding 和 LLM 的文本。"""
+    if not records:
+        return ""
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    # 越靠后的流程记录通常越接近最终解决结论，优先保留，避免总长度截断
+    # 时把测试结果和审核意见裁掉。
+    for record in reversed(records):
+        parts: list[str] = []
+        for field in record.get("fields") or []:
+            raw_value = field.get("value")
+            value = clean_html(
+                raw_value
+                if isinstance(raw_value, str)
+                else ("" if raw_value is None else str(raw_value))
+            )
+            if not value or value in ("/", "-", "无", "暂无"):
+                continue
+            if field.get("name") in ("result", "test_result"):
+                value = {"1": "通过", "0": "不通过"}.get(value, value)
+            parts.append(f"{field.get('label') or field.get('name')}: {value}")
+        if not parts:
+            continue
+        line = f"[{record.get('label') or record.get('source')}] " + " | ".join(parts)
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+
+    text = "\n".join(lines)
+    if len(text) > max_len:
+        text = text[:max_len] + "…(truncated)"
+    return text
+
+
+def build_resolution_text(journal_resolution: str, form_records_text: str) -> str:
+    """合并普通 journal 解决记录与结构化研发/测试记录。"""
+    parts: list[str] = []
+    if journal_resolution:
+        parts.append("[处理记录] " + journal_resolution)
+    if form_records_text:
+        parts.append(form_records_text)
+    text = "\n".join(parts)
+    if len(text) > _MAX_FORM_RECORDS_LEN:
+        text = text[:_MAX_FORM_RECORDS_LEN] + "…(truncated)"
+    return text
 
 
 def detect_r_and_d_communication(journals: list[dict]) -> tuple[bool, list[str]]:

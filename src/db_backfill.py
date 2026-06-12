@@ -26,7 +26,12 @@ from pathlib import Path
 from .config import cfg, project_root
 from .db_client import RedmineDB
 from .embedder import Embedder
-from .text_cleaner import build_issue_text, clean_html, find_resolution_notes
+from .text_cleaner import (
+    build_form_records_text,
+    build_issue_text,
+    build_resolution_text,
+    find_resolution_notes,
+)
 from .vector_store import VectorStore
 
 
@@ -75,9 +80,10 @@ def _process_chunk(
     if not chunk:
         return 0
 
-    # 一次性拉这批 issue 的 journals
+    # 一次性拉这批 issue 的 journals + 研发/测试表单
     ids = [it["id"] for it in chunk]
     journals_by_id = db.fetch_journals_bulk(ids)
+    forms_by_id = db.fetch_form_records_bulk(ids)
 
     texts: list[str] = []
     metas: list[dict] = []
@@ -86,9 +92,11 @@ def _process_chunk(
         subject = it.get("subject") or ""
         desc = it.get("description") or ""
         jrows = journals_by_id.get(iid, [])
-        resolution = find_resolution_notes(
+        journal_resolution = find_resolution_notes(
             _build_journals_for_cleaner(jrows, status_map)
         )
+        form_text = build_form_records_text(forms_by_id.get(iid, []))
+        resolution = build_resolution_text(journal_resolution, form_text)
         embed_text = build_issue_text(subject, desc) + (
             "\n[解决方案] " + resolution if resolution else ""
         )

@@ -2,6 +2,11 @@
 
 > 给"项目支持"子树下新建的「支持」工单自动添加 AI 一楼，附带历史相似案件和当时的解决方案。
 
+历史案件的检索文本来自 `issues`、`journals`，以及通过 `issue_id`
+关联的 `form_develop_*`、`form_tester_verify*`、`form_product_verify`
+研发/测试操作记录。新增这些字段后需要重跑 `src.db_backfill --rebuild`
+才能更新存量向量。
+
 ## 一、当前部署位置
 
 | 维度 | 值 |

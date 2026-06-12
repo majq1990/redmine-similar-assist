@@ -33,7 +33,9 @@ from .db_client import RedmineDB
 from .embedder import Embedder
 from .notify import post_dingtalk
 from .text_cleaner import (
+    build_form_records_text,
     build_issue_text,
+    build_resolution_text,
     detect_confirmed_handling_path,
     detect_r_and_d_communication,
     find_resolution_notes,
@@ -366,6 +368,7 @@ def run_once(max_items: int | None = None) -> dict:
 
         ids = [r["id"] for r in rows]
         journals_by_id = db.fetch_journals_bulk(ids)
+        forms_by_id = db.fetch_form_records_bulk(ids)
 
         cheap = 0
         expensive_texts: list[str] = []
@@ -380,7 +383,11 @@ def run_once(max_items: int | None = None) -> dict:
             subject = it.get("subject") or ""
             desc = it.get("description") or ""
             jrows = journals_by_id.get(iid, [])
-            resolution = find_resolution_notes(_build_journals_for_cleaner(jrows))
+            journal_resolution = find_resolution_notes(
+                _build_journals_for_cleaner(jrows)
+            )
+            form_text = build_form_records_text(forms_by_id.get(iid, []))
+            resolution = build_resolution_text(journal_resolution, form_text)
             embed_text = build_issue_text(subject, desc) + (
                 "\n[解决方案] " + resolution if resolution else ""
             )

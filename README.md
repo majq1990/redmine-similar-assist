@@ -23,7 +23,7 @@
 [fetch issue detail]  GET /issues/{id}.json?include=journals
      │
      ▼
-[clean text]  HTML→纯文本，去 img/cangjie/堆栈
+[clean text]  issue + journals + form_* 研发/测试记录，HTML→纯文本
      │
      ▼
 [embed]  SiliconFlow bge-m3 → 1024 维向量

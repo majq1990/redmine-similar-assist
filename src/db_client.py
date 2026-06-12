@@ -4,6 +4,7 @@
   - iter_issues_for_backfill(): 按 id 翻页流式拉所有 issue
   - iter_issues_updated_since(ts): 增量拉 updated_on > ts 的 issue
   - fetch_journals_bulk(ids): 一次性拉一批 issue 的 journals + status 变更明细
+  - fetch_form_records_bulk(ids): 批量拉研发/测试表单操作记录
   - get_status_map(): 拿 issue_statuses 表（id → name + is_closed）
 
 注意：notes 字段可能含大富文本/HTML，原样返回，上层 text_cleaner 清洗。
@@ -18,6 +19,85 @@ import pymysql
 from pymysql.cursors import SSDictCursor  # 服务端游标，流式
 
 from .config import cfg
+
+
+FORM_RECORD_SPECS: tuple[dict, ...] = (
+    {
+        "table": "form_develop_design",
+        "label": "研发设计",
+        "fields": (
+            ("version_description", "版本说明"),
+            ("db_change_description", "数据库变更"),
+            ("performance_design", "性能设计"),
+            ("develop_design_url", "设计文档"),
+            ("find_error", "自查问题"),
+        ),
+    },
+    {
+        "table": "form_develop_design_audit",
+        "label": "研发设计审核",
+        "fields": (
+            ("result", "审核结果"),
+            ("content", "审核意见"),
+            ("repeat_reason", "重复原因"),
+            ("repeat_reason_other", "其他原因"),
+        ),
+    },
+    {
+        "table": "form_develop_finish",
+        "label": "研发完成",
+        "fields": (
+            ("function_description", "功能修改"),
+            ("changelog_description", "变更说明"),
+            ("config_description", "配置说明"),
+            ("interface_description", "接口说明"),
+            ("test_point", "测试要点"),
+            ("function_affected", "影响功能"),
+            ("ai_code_review", "代码自查"),
+        ),
+    },
+    {
+        "table": "form_develop_finish_audit",
+        "label": "研发完成审核",
+        "fields": (
+            ("result", "审核结果"),
+            ("content", "审核意见"),
+            ("function_affected", "影响功能"),
+            ("repeat_reason", "重复原因"),
+            ("repeat_reason_other", "其他原因"),
+        ),
+    },
+    {
+        "table": "form_tester_verify",
+        "label": "测试验证",
+        "fields": (
+            ("test_content", "测试内容"),
+            ("test_point", "测试要点"),
+            ("test_result", "测试结果"),
+            ("test_result_description", "结果说明"),
+            ("remain_problems", "遗留问题"),
+            ("update_description", "更新说明"),
+        ),
+    },
+    {
+        "table": "form_tester_verify_review",
+        "label": "测试审核",
+        "fields": (
+            ("result", "审核结果"),
+            ("content", "审核意见"),
+            ("evaluation_name", "扣分问题"),
+        ),
+    },
+    {
+        "table": "form_product_verify",
+        "label": "产品验证",
+        "fields": (
+            ("verify_content", "验证内容"),
+            ("confirm_description", "确认说明"),
+            ("demand_consistency", "需求一致性"),
+        ),
+    },
+)
 
 
 def _conn_kwargs() -> dict:
@@ -203,3 +283,52 @@ class RedmineDB:
                     }
                 )
             return out
+
+    def fetch_form_records_bulk(self, issue_ids: list[int]) -> dict[int, list[dict]]:
+        """批量拉研发、测试和产品验证表单，通过 issue_id 聚合。
+
+        fields 保留原始 HTML，统一交给 text_cleaner 清洗。相关表都有
+        issue_id 索引，按 backfill chunk 查询不会扫全表。
+        """
+        if not issue_ids:
+            return {}
+
+        placeholders = ",".join("%s" for _ in issue_ids)
+        out: dict[int, list[dict]] = {}
+        with self._conn() as (_, cur):
+            for spec in FORM_RECORD_SPECS:
+                field_names = [name for name, _ in spec["fields"]]
+                selected = ", ".join(f"`{name}`" for name in field_names)
+                cur.execute(
+                    f"""SELECT issue_id, create_time, user_name, {selected}
+                          FROM `{spec['table']}`
+                         WHERE issue_id IN ({placeholders})
+                         ORDER BY issue_id, create_time, id""",
+                    tuple(issue_ids),
+                )
+                for row in cur.fetchall():
+                    issue_id = int(row["issue_id"])
+                    out.setdefault(issue_id, []).append(
+                        {
+                            "source": spec["table"],
+                            "label": spec["label"],
+                            "created_on": row.get("create_time"),
+                            "user_name": row.get("user_name") or "",
+                            "fields": [
+                                {
+                                    "name": name,
+                                    "label": label,
+                                    "value": row.get(name),
+                                }
+                                for name, label in spec["fields"]
+                            ],
+                        }
+                    )
+        for records in out.values():
+            records.sort(
+                key=lambda x: (
+                    x.get("created_on") or dt.datetime.min,
+                    x.get("source") or "",
+                )
+            )
+        return out
