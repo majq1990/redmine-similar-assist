@@ -35,6 +35,14 @@ recall:
   min_cosine: 0.65       # 低于这个直接丢
   llm_filter_top: 5      # 送给 LLM 精排的最大数量
   final_top: 3           # 最终写入 issue 的条数上限
+  # 知识库文档召回模式：
+  #   chunk: 按 markdown heading 切片 embed，KNN 在 chunks 上做，按 doc 聚合（推荐）
+  #   doc:   整篇 embed（回退路径，B1 上线前的旧行为）
+  doc_chunks_mode: chunk
+  docs_knn_top: 15
+  docs_min_cosine: 0.45
+  docs_min_llm_score: 0.45
+  docs_final_top: 5
 
 # Webhook 服务
 webhook:

@@ -28,6 +28,16 @@ _MAX_LEN = 4000
 _MAX_CODE_LEN = 400
 _MAX_FORM_RECORDS_LEN = 5000
 
+# ===== markdown chunk splitting (for B1 doc chunked embedding) =====
+# 砍图片/HTML 标签时保留 markdown 结构（heading/列表）
+_MD_IMG_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_MD_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+# 行内空白折叠（不跨行，保留段落分隔）
+_MD_INLINE_WS_RE = re.compile(r"[ \t]+")
+# 3 个以上空行 → 2 个
+_MD_MULTI_BLANK_RE = re.compile(r"\n{3,}")
+
 
 def clean_html(text: str | None) -> str:
     if not text:
@@ -263,3 +273,164 @@ def find_resolution_notes(journals: list[dict]) -> str:
         if notes:
             parts.append(notes)
     return " || ".join(parts)
+
+
+# ========== Markdown 切片（B1 doc chunked embedding 用） ==========
+
+
+def _md_pre_clean(md: str) -> str:
+    """保留 heading 结构的轻清洗：砍图片占位、内联 HTML、折叠行内空白、压缩多空行。"""
+    if not md:
+        return ""
+    md = _MD_IMG_RE.sub("[img]", md)
+    md = _MD_HTML_TAG_RE.sub(" ", md)
+    # 行内空白折叠，但保留换行（heading/段落边界）
+    lines = [_MD_INLINE_WS_RE.sub(" ", line).strip() for line in md.split("\n")]
+    md = "\n".join(lines)
+    md = _MD_MULTI_BLANK_RE.sub("\n\n", md).strip()
+    return md
+
+
+def _hard_split(text: str, max_len: int) -> list[str]:
+    """单段超长时按段落 → 句号硬切到 max_len 以内。"""
+    if len(text) <= max_len:
+        return [text]
+    out: list[str] = []
+    buf = ""
+    # 优先按 \n\n、然后 \n、再按 中文/英文 句号
+    paragraphs = text.split("\n\n")
+    for p in paragraphs:
+        if len(buf) + len(p) + 2 <= max_len:
+            buf = (buf + "\n\n" + p) if buf else p
+            continue
+        if buf:
+            out.append(buf)
+            buf = ""
+        if len(p) <= max_len:
+            buf = p
+            continue
+        # 段落本身超长 → 按句号切
+        for piece in re.split(r"(?<=[。！？!?\n])", p):
+            if not piece:
+                continue
+            if len(buf) + len(piece) <= max_len:
+                buf += piece
+            else:
+                if buf:
+                    out.append(buf)
+                buf = piece if len(piece) <= max_len else piece[:max_len]
+    if buf:
+        out.append(buf)
+    return out
+
+
+def split_markdown_chunks(
+    md: str,
+    max_chunk_len: int = 800,
+    min_chunk_len: int = 100,
+) -> list[dict]:
+    """按 markdown heading 切片。
+
+    规则：
+      1. 用 ^#{1,6} 切，每段含"上方最近的 heading 路径"作为上下文标题
+      2. 单 chunk 超 max_chunk_len → 按段落/句号硬切
+      3. chunk 太短（< min_chunk_len）→ 合并到下一段，保持上下文完整
+      4. 完全无 heading 的文档 → 整体进切片器硬切
+
+    Returns:
+        [{"idx": 0, "heading": "1. 部署", "text": "..."}]
+        idx 是文档内 chunk 序号（0-based），用于稳定 rowid。
+    """
+    md = _md_pre_clean(md)
+    if not md:
+        return []
+
+    # 收集所有 heading 位置，构造 [(start, level, title), ...]
+    heads: list[tuple[int, int, str]] = []
+    for m in _MD_HEADING_RE.finditer(md):
+        heads.append((m.start(), len(m.group(1)), m.group(2).strip()))
+
+    sections: list[tuple[str, str]] = []  # [(heading_path, body)]
+    if not heads:
+        sections.append(("", md))
+    else:
+        # 处理 heading 之前的引言
+        if heads[0][0] > 0:
+            lead = md[: heads[0][0]].strip()
+            if lead:
+                sections.append(("", lead))
+        # heading_stack[level] = title；按级别维护路径
+        stack: dict[int, str] = {}
+        for i, (start, level, title) in enumerate(heads):
+            end = heads[i + 1][0] if i + 1 < len(heads) else len(md)
+            # 截到下一个 heading 前
+            body = md[start:end]
+            # 去掉自己这行 heading（路径里已经放了）
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+            body = body.strip()
+            # 更新 heading 路径
+            stack = {lv: t for lv, t in stack.items() if lv < level}
+            stack[level] = title
+            path = " / ".join(stack[k] for k in sorted(stack))
+            if body:
+                sections.append((path, body))
+
+    # 切片：每个 section 先看长度，长则硬切，短则缓存
+    out: list[dict] = []
+    pending_heading = ""
+    pending_text = ""
+    for heading, body in sections:
+        full = (f"[{heading}]\n{body}" if heading else body).strip()
+        for piece in _hard_split(full, max_chunk_len):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if len(piece) < min_chunk_len and pending_text:
+                # 太短 → 拼到 pending
+                pending_text = pending_text + "\n" + piece
+            elif len(piece) < min_chunk_len:
+                pending_heading = heading
+                pending_text = piece
+            else:
+                # 先吐 pending
+                if pending_text:
+                    out.append(
+                        {
+                            "idx": len(out),
+                            "heading": pending_heading,
+                            "text": pending_text.strip(),
+                        }
+                    )
+                    pending_heading = ""
+                    pending_text = ""
+                out.append(
+                    {"idx": len(out), "heading": heading, "text": piece}
+                )
+    if pending_text.strip():
+        out.append(
+            {
+                "idx": len(out),
+                "heading": pending_heading,
+                "text": pending_text.strip(),
+            }
+        )
+    return out
+
+
+def get_chunk_with_context(
+    chunks: list[dict], hit_idx: int, neighbors: int = 1
+) -> str:
+    """LLM judge 输入：取命中 chunk + 前后各 N 段，拼成上下文。"""
+    if not chunks:
+        return ""
+    lo = max(0, hit_idx - neighbors)
+    hi = min(len(chunks), hit_idx + neighbors + 1)
+    parts: list[str] = []
+    for c in chunks[lo:hi]:
+        heading = c.get("heading") or ""
+        text = c.get("text") or ""
+        if heading and not text.startswith(f"[{heading}]"):
+            parts.append(f"[{heading}] {text}")
+        else:
+            parts.append(text)
+    return "\n---\n".join(parts)

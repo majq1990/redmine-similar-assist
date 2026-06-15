@@ -11,8 +11,18 @@ from .config import cfg, is_project_targeted, project_root
 from .embedder import Embedder
 from .llm_judge import judge, judge_docs
 from .redmine_client import RedmineClient
-from .text_cleaner import build_issue_text, clean_html, find_resolution_notes
-from .vector_store import VectorStore, get_vector_store, get_doc_store
+from .text_cleaner import (
+    build_issue_text,
+    clean_html,
+    find_resolution_notes,
+    get_chunk_with_context,
+)
+from .vector_store import (
+    VectorStore,
+    get_chunk_store,
+    get_doc_store,
+    get_vector_store,
+)
 
 
 def _ensure_log_db() -> sqlite3.Connection:
@@ -154,16 +164,66 @@ def ingest_new_issue(issue_id: int, dry_run: bool | None = None) -> dict:
     candidates = [x for x in candidates if x["cosine"] >= c["recall"]["min_cosine"]]
     candidates = candidates[: c["recall"]["llm_filter_top"]]
 
-    # 同时从钉钉知识库召回 top docs（独立索引，独立阈值）
+    # 同时从钉钉知识库召回 top docs
+    # 默认走 chunk 模式（B1）：先在 chunks 召回，按 node_id 聚合每 doc 取最高分 chunk
+    # 退路：config.recall.doc_chunks_mode='doc' 走旧的整篇 embed
     doc_candidates: list[dict] = []
+    docs_top = int(c["recall"].get("docs_knn_top", 5))
+    docs_min = float(c["recall"].get("docs_min_cosine", 0.55))
+    mode = (c["recall"].get("doc_chunks_mode") or "chunk").lower()
     try:
         ds = get_doc_store()
-        docs_top = int(c["recall"].get("docs_knn_top", 5))
-        docs_min = float(c["recall"].get("docs_min_cosine", 0.55))  # 文档跟工单跨域，门槛低些
-        doc_candidates = [d for d in ds.knn(emb, top=docs_top) if d["cosine"] >= docs_min]
+        if mode == "chunk":
+            cs = get_chunk_store()
+            # 守护：ChunkStore 还没数据（B1 全量 backfill 未完成）时自动回退 doc 模式
+            if cs._index.ntotal == 0:
+                import sys as _sys
+                _sys.stderr.write(
+                    "[pipeline] chunk mode but ChunkStore empty, "
+                    "fallback to doc mode\n"
+                )
+                mode = "doc"
+        if mode == "chunk":
+            # 多召 3 倍 chunks，按 node_id 聚合再截到 docs_top
+            raw_hits = cs.knn(emb, top=docs_top * 3)
+            # 按 node_id 取最高分 chunk
+            best_by_nid: dict[str, dict] = {}
+            for h in raw_hits:
+                if h["cosine"] < docs_min:
+                    continue
+                nid = h["node_id"]
+                if nid not in best_by_nid or h["cosine"] > best_by_nid[nid]["cosine"]:
+                    best_by_nid[nid] = h
+            # 按 cosine 排序取 docs_top，从 docs_meta 补 title/url
+            sorted_hits = sorted(
+                best_by_nid.values(), key=lambda x: -x["cosine"]
+            )[:docs_top]
+            for h in sorted_hits:
+                meta = ds.get_meta(h["node_id"])
+                if not meta:
+                    continue
+                doc_candidates.append(
+                    {
+                        "node_id": h["node_id"],
+                        "title": meta.get("title") or "",
+                        "url": meta.get("url") or "",
+                        "summary": meta.get("summary") or "",
+                        "cosine": h["cosine"],
+                        "chunk_idx": h["chunk_idx"],
+                        "chunk_heading": h["heading"],
+                        "chunk_text": h["text"],
+                    }
+                )
+        else:
+            # 旧路径：整篇 embed 召回
+            doc_candidates = [
+                d for d in ds.knn(emb, top=docs_top) if d["cosine"] >= docs_min
+            ]
     except Exception as e:
         import sys as _sys
-        _sys.stderr.write(f"[pipeline] doc knn failed for {issue_id}: {e}\n")
+        _sys.stderr.write(
+            f"[pipeline] doc knn failed for {issue_id} (mode={mode}): {e}\n"
+        )
 
     if not candidates and not doc_candidates:
         # 既没工单也没文档召回 → 写"暂无推荐"一楼
@@ -214,16 +274,41 @@ def ingest_new_issue(issue_id: int, dry_run: bool | None = None) -> dict:
         picks = picks[: c["recall"]["final_top"]]
 
     # 2) 知识库文档 LLM gate（独立、宽松 prompt）
+    # chunk 模式：summary 用"命中 chunk + 前后各一段"代替整篇前 600 字，让 LLM 看到的是真正相关的段落
     doc_picks: list[dict] = []
     if doc_candidates:
         try:
+            # chunk 模式下批量取每个 doc 的全部 chunks，构造上下文
+            ctx_by_nid: dict[str, str] = {}
+            if mode == "chunk":
+                try:
+                    cs = get_chunk_store()
+                    for d in doc_candidates:
+                        all_chunks = cs.get_doc_chunks(d["node_id"])
+                        hit_idx = d.get("chunk_idx", 0)
+                        # chunks 已按 idx 升序，hit_idx 就是位置
+                        pos = next(
+                            (i for i, x in enumerate(all_chunks) if x["idx"] == hit_idx),
+                            0,
+                        )
+                        ctx_by_nid[d["node_id"]] = get_chunk_with_context(
+                            all_chunks, hit_idx=pos, neighbors=1
+                        )
+                except Exception as e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[pipeline] build chunk context failed: {e}\n"
+                    )
             doc_verdicts = judge_docs(
                 text,
                 [
                     {
                         "node_id": d["node_id"],
                         "title": d.get("title") or "",
-                        "summary": (d.get("summary") or "")[:600],
+                        "summary": (
+                            ctx_by_nid.get(d["node_id"])
+                            or (d.get("summary") or "")
+                        )[:1500],
                     }
                     for d in doc_candidates
                 ],
