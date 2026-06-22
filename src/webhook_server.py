@@ -15,7 +15,7 @@ from flask import Flask, jsonify, request
 from .config import cfg, is_project_targeted
 from .pipeline import ingest_new_issue
 from . import sync as sync_module
-from .vector_store import get_vector_store, get_doc_store
+from .vector_store import get_vector_store, get_doc_store, get_chunk_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("webhook")
@@ -30,12 +30,13 @@ _ready = threading.Event()
 
 
 def _warmup() -> None:
-    log.info("warming up VectorStore + DocStore in background (faiss load ~7min)...")
+    log.info("warming up VectorStore + DocStore + ChunkStore in background...")
     try:
         get_vector_store()
         get_doc_store()
+        get_chunk_store()  # B1: chunk 粒度索引也预热
         _ready.set()
-        log.info("VectorStore + DocStore ready")
+        log.info("VectorStore + DocStore + ChunkStore ready")
     except Exception:
         log.exception("warmup failed")
 
