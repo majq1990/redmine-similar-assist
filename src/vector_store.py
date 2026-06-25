@@ -204,26 +204,39 @@ class VectorStore:
         self.conn.commit()
 
     def knn(
-        self, embedding: list[float], top: int, exclude_id: int | None = None
+        self,
+        embedding: list[float],
+        top: int,
+        exclude_id: int | None = None,
+        tracker_filter: set[int] | None = None,
     ) -> list[dict]:
+        """KNN 召回。tracker_filter 非空时仅返回 tracker_id ∈ filter 的工单。
+
+        实现：faiss 过召集（top × 8）→ SQL 按 tracker_id IN(...) 过滤 → 截 top。
+        过召集是为了应对 tracker 命中率低（最坏 25%）仍能凑够 top。
+        """
         if self._index.ntotal == 0:
             return []
         q = _l2_normalize(np.asarray(embedding, dtype="float32")).reshape(1, -1)
-        k = top + (1 if exclude_id else 0)
+        over = 8 if tracker_filter else 1
+        k = (top + (1 if exclude_id else 0)) * over
         D, I = self._index.search(q, k)  # D: cos sim, I: issue_id
         out: list[dict] = []
-        # 一次性把候选 meta 拿出来，避免 N+1
         ids = [int(i) for i in I[0] if i != -1 and (not exclude_id or int(i) != exclude_id)]
         if not ids:
             return []
         placeholders = ",".join("?" * len(ids))
-        rows = self.conn.execute(
-            f"SELECT issue_id, subject, status, closed_on, resolution "
-            f"FROM issues_meta WHERE issue_id IN ({placeholders})",
-            ids,
-        ).fetchall()
+        sql = (
+            f"SELECT issue_id, subject, status, closed_on, resolution, tracker_id "
+            f"FROM issues_meta WHERE issue_id IN ({placeholders})"
+        )
+        params: list = list(ids)
+        if tracker_filter:
+            tracker_list = list(tracker_filter)
+            sql += " AND tracker_id IN (" + ",".join("?" * len(tracker_list)) + ")"
+            params += tracker_list
+        rows = self.conn.execute(sql, params).fetchall()
         meta_by_id = {r[0]: r for r in rows}
-        # 按 faiss 返回顺序输出
         seen = 0
         for cos_sim, iid in zip(D[0], I[0]):
             iid = int(iid)
@@ -234,7 +247,7 @@ class VectorStore:
             m = meta_by_id.get(iid)
             if not m:
                 continue
-            _, subject, status, closed_on, resolution = m
+            _, subject, status, closed_on, resolution, tracker_id = m
             cosine = float(cos_sim)  # 已是余弦
             out.append(
                 {
@@ -245,6 +258,7 @@ class VectorStore:
                     "status": status,
                     "closed_on": closed_on,
                     "resolution": resolution,
+                    "tracker_id": tracker_id,
                 }
             )
             seen += 1

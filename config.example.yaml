@@ -97,6 +97,10 @@ triage:
   notify_keyword: ""
 
 # 回写策略
+# Precheck/MCP 端点鉴权 token（nginx 与服务端共用）
+precheck:
+  token: "TODO_RANDOM_HEX_TOKEN"
+
 write_back:
   enabled: false              # 阶段 1 先 false，只生成不真写；验证 OK 再改 true
   note_header: "🤖 AI 智能助理建议（仅供参考，请人工判断）"

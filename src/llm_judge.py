@@ -32,13 +32,13 @@ _PROMPT = """你是 Redmine 工单助理。你的任务：判断每条"历史案
 
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=2, max=8))
-def _call(messages: list[dict]) -> str:
+def _call(messages: list[dict], max_tokens: int | None = None) -> str:
     c = cfg()["llm"]
     payload = {
         "model": c["model"],
         "messages": messages,
         "temperature": c.get("temperature", 0.1),
-        "max_tokens": c.get("max_tokens", 800),
+        "max_tokens": max_tokens or c.get("max_tokens", 800),
         "response_format": {"type": "json_object"},
     }
     r = requests.post(
@@ -48,10 +48,21 @@ def _call(messages: list[dict]) -> str:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=60,
+        timeout=120,
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
+    if not content or not content.strip():
+        # 暴露 finish_reason / usage 帮助诊断（content_filter / length / 等）
+        import sys as _sys
+        choice = data["choices"][0]
+        _sys.stderr.write(
+            f"[llm_judge] empty content! finish_reason={choice.get('finish_reason')!r}, "
+            f"usage={data.get('usage')}, "
+            f"raw_msg_keys={list(choice.get('message', {}).keys())}\n"
+        )
+    return content or ""
 
 
 def _extract_json_array(raw: str) -> list[Any]:
@@ -63,10 +74,15 @@ def _extract_json_array(raw: str) -> list[Any]:
         m = re.search(r"\[[\s\S]*\]", raw)
         if not m:
             return []
-        obj = json.loads(m.group(0))
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return []
     if isinstance(obj, list):
         return obj
-    for k in ("results", "data", "items"):
+    if not isinstance(obj, dict):
+        return []
+    for k in ("results", "data", "items", "clusters"):
         if isinstance(obj.get(k), list):
             return obj[k]
     return []

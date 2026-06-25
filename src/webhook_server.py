@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 from .config import cfg, is_project_targeted
 from .pipeline import ingest_new_issue
@@ -126,6 +126,153 @@ def sync_incremental():
     except Exception as e:
         log.exception("sync failed")
         return jsonify({"error": str(e)}), 500
+
+
+@app.post("/precheck")
+def precheck_endpoint():
+    """对接前置避坑：输入业务描述，返回 top N 高频问题模式。
+
+    给钉钉智能助理 Action 调；也可 curl 调试。
+    Body: {"description": "...", "top_issues": 50, "top_docs": 15}
+    Response: {"markdown": "...", "items": [...], "stats": {...}}
+    """
+    if not _ready.is_set():
+        return jsonify({"error": "warming_up", "ready": False}), 503
+    body = request.get_json(silent=True) or {}
+    description = (body.get("description") or "").strip()
+    if not description:
+        return jsonify({"error": "description required"}), 400
+    if len(description) > 4000:
+        return jsonify({"error": "description too long (max 4000 chars)"}), 400
+    top_issues = int(body.get("top_issues") or 30)
+    top_docs = int(body.get("top_docs") or 10)
+    try:
+        # 延迟 import 避免循环（precheck 拉 pipeline 依赖链）
+        from .precheck import run_precheck
+        res = run_precheck(
+            description, top_issues=top_issues, top_docs=top_docs
+        )
+        log.info(
+            "precheck -> n_issues=%s n_docs=%s n_clusters=%s ms=%s",
+            res["stats"]["n_issues"],
+            res["stats"]["n_docs"],
+            res["stats"]["n_clusters"],
+            res["stats"]["elapsed_ms"],
+        )
+        return jsonify(res), 200
+    except Exception as e:
+        log.exception("precheck failed")
+        return jsonify({"error": str(e)}), 500
+
+
+def _check_mcp_auth(req) -> bool:
+    """MCP 端点 Bearer 鉴权。token 配在 cfg.precheck.token；nginx 也校验同 token 兜底。"""
+    expected = ((cfg().get("precheck") or {}).get("token") or "").strip()
+    if not expected:
+        return True  # 未配 token = 不校验（依赖 nginx 层）
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return auth[7:].strip() == expected
+
+
+@app.route("/mcp", methods=["OPTIONS"])
+def mcp_options_endpoint():
+    """CORS / preflight 探测。钉钉 deap MCP 客户端会发 OPTIONS 探测，
+    必须返回 200 + 正确 Content-Type（json），否则钉钉报 'Unknown media type text/html'。"""
+    return jsonify({"ok": True}), 200, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400",
+    }
+
+
+@app.get("/mcp")
+def mcp_sse_endpoint():
+    """MCP streamable-http GET 端点：钉钉 client initialize 后会 GET 此地址
+    建立"服务端→客户端"的 SSE 流（spec 可选）。
+
+    我们当前不需要主动推送，但钉钉客户端不接受 405 HTML，所以返回长保活 SSE：
+    每 25s 发一个 SSE 注释行 ': ping\\n\\n' 维持连接，让钉钉客户端持续等待。
+    """
+    if not _check_mcp_auth(request):
+        return Response("unauthorized", status=401, mimetype="text/plain")
+
+    # streamable-http 协议下，GET 是给 server 主动推消息用的，spec 可选。
+    # 钉钉 client 会 GET 后立即断开（健康探测），不期待持续推送。
+    # 流首发个 SSE 注释让 Content-Type=text/event-stream 解析成功即可。
+    def event_stream():
+        import time as _t
+        yield ": mcp ready\n\n"
+        try:
+            while True:
+                _t.sleep(25)
+                yield ": keepalive\n\n"
+        except GeneratorExit:
+            return
+
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # 关键：让 nginx 不要 buffer SSE
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _sse_response(jsonrpc_msg: dict, status: int = 200):
+    """把 JSON-RPC response 包成 SSE 单 message 返回。
+
+    钉钉 deap 的 MCP client 在 streamable-http 协议下只接受 text/event-stream
+    作为 POST 响应，application/json 会被误判为 'Unknown media type'。
+    """
+    import json as _json
+    body = f"event: message\ndata: {_json.dumps(jsonrpc_msg, ensure_ascii=False)}\n\n"
+    return Response(
+        body,
+        status=status,
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/mcp")
+def mcp_endpoint():
+    """MCP streamable-http 端点：钉钉 AI 助理 / deap 通过 JSON-RPC 2.0 调用。
+
+    根据 Accept header 决定返回格式：
+      - 含 text/event-stream → SSE
+      - 否则 → application/json（spec 允许）
+    钉钉 deap 客户端必须走 SSE。
+    """
+    if not _check_mcp_auth(request):
+        msg = {"jsonrpc": "2.0", "id": None,
+               "error": {"code": -32001, "message": "unauthorized"}}
+        return _sse_response(msg, status=401)
+    if not _ready.is_set():
+        msg = {"jsonrpc": "2.0", "id": None,
+               "error": {"code": -32000, "message": "warming_up, retry in 5min"}}
+        return _sse_response(msg, status=503)
+
+    body = request.get_json(silent=True) or {}
+    from .mcp_server import handle_mcp
+    try:
+        res = handle_mcp(body)
+    except Exception as e:
+        log.exception("mcp dispatch failed")
+        return _sse_response({"jsonrpc": "2.0", "id": body.get("id"),
+                              "error": {"code": -32603, "message": str(e)}},
+                             status=500)
+    if res is None:
+        # notification 无响应（HTTP 200 空 SSE，钉钉接受空流）
+        return Response("", status=200, mimetype="text/event-stream")
+    return _sse_response(res)
 
 
 if __name__ == "__main__":
