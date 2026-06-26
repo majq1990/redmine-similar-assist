@@ -239,3 +239,80 @@ CKEditor 渲染时 `<a>` 自动可点击。
 本地：`D:\git\redmine-similar-assist`
 
 `config.yaml` 在 `.gitignore`，不进 git。其他全部入库即可。
+
+远程：
+- GitHub: `origin = github.com/majq1990/redmine-similar-assist`（fetch 走 ghfast.top）
+- gitlab 内网: `gitlab.egova.com.cn:222/devops/redmine-similar-assist`（main 是保护分支，提交走 `jscz-yyyymmdd` 分支再 MR）
+
+---
+
+# 十二、precheck 对接前置避坑工具（2026-06-25 上线）
+
+业务人员/工程师在启动一个对接业务前，**贴一句业务描述**自动从 17 万历史工单 + 4500 钉钉文档中聚类高频踩坑，提前规避。
+
+## 12.1 入口（按使用便捷度排序）
+
+| 入口 | URL/命令 | 适用 |
+|---|---|---|
+| **Claude Code skill** | 用户说"对接避坑/precheck/做xx对接想知道坑" 自动触发 | **业务/工程师推荐** |
+| HTTP API 直调 | `POST https://demo.egova.com.cn/redmine-assist/precheck` | 自动化/脚本/集成 |
+| 容器内 CLI | `docker exec -e PYTHONPATH=/app -w /app redmine-assist python -m src.precheck "<描述>"` | 调试 |
+
+## 12.2 HTTP 接口
+
+```bash
+curl -sS -m 180 -X POST https://demo.egova.com.cn/redmine-assist/precheck \
+  -H "Content-Type: application/json" \
+  -H "X-Precheck-Token: <token>" \
+  -d '{"description": "做车载GPS轨迹对接，对方808协议走TCP"}'
+```
+
+- token 存：`/etc/redmine-assist/precheck_token`（600 权限）
+- nginx 反代：`/etc/nginx/conf.d/default.conf` 内 `location = /redmine-assist/precheck` 校验 `X-Precheck-Token` header
+- 端到端 45-60 秒（含 LLM 推理）
+
+返回 JSON：`{markdown, items[], stats{n_issues,n_docs,n_clusters,elapsed_ms}}`
+
+## 12.3 核心代码
+
+| 模块 | 职责 |
+|---|---|
+| `src/precheck.py` | 主流程：双路 KNN（issues 限 5 类故障 tracker + chunks）→ LLM 聚类→ markdown |
+| `src/webhook_server.py` `precheck_endpoint` | HTTP /precheck 端点（Bearer/X-Precheck-Token 鉴权） |
+| `src/llm_judge.py` `_call(messages, max_tokens=...)` | LLM 调用，**max_tokens=12000** 应对 DeepSeek-v4-flash reasoning_content 占配额 |
+
+## 12.4 故障 tracker 池
+
+固定 5 类（实际"出过事"的工单）：
+```python
+FAULT_TRACKERS = {3, 1, 22, 26, 27}  # 支持/BUG/适配/安全/性能 共 5.3 万
+```
+排除：需求/开发/UI/代码审核/里程碑 等纯流程类。
+
+## 12.5 钉钉 deap MCP 集成尝试（已弃）
+
+`src/mcp_server.py` 是 streamable-http MCP server（JSON-RPC 2.0），原计划接钉钉 deap AI 助理。
+反复调试发现 deap 的 Java Reactor MCP client **不严格遵循 MCP spec**：
+- 已修：必返 `mcp-session-id` header、SSE chunked transfer、DELETE 终止、OPTIONS preflight
+- 仍卡：Reactor `map` operator `8000ms no item or terminal signal` 错误，参考其他 MCP 也有类似现象
+
+**结论**：放弃 MCP 集成路线，改走 **Claude Code skill** 直调 HTTP /precheck（已上线）。
+`src/mcp_server.py` 保留作技术参考，nginx `/redmine-assist/mcp` 仍可用（curl 测试 OK）。
+
+## 12.6 Claude Code skill
+
+| 项 | 值 |
+|---|---|
+| skill 名 | `precheck-integration`（"对接前置避坑"）|
+| 本地位置 | `~/.claude/skills/对接前置避坑/SKILL.md` |
+| 企业分发 | `demo:8091`（skill-server）→ `precheck-integration` |
+| visibility | `support-dept`（技术支持部+技术经理可见，可后续扩 global） |
+| 触发词 | 对接前置 / 对接避坑 / 对接踩坑 / 启动对接 / precheck |
+| 维护 | majianquan |
+
+## 12.7 已知小问题/后续优化
+
+- chunk_store 重启冷加载 39k chunks 需 ~120s（已并行 warmup 不阻塞端口）
+- 钉钉 deap MCP 不兼容（见 12.5），如未来 deap Reactor 改了 spec 可重试
+- 文档增量 backfill 跑过一次后有 172 个文档未入库（96.2% 覆盖），可日后补全
+- 接口/skill 都默认走"支持部"可见性，业务侧用户需手动 install
