@@ -176,6 +176,14 @@ def _check_mcp_auth(req) -> bool:
     return auth[7:].strip() == expected
 
 
+@app.route("/mcp", methods=["DELETE"])
+def mcp_delete_endpoint():
+    """spec 2025-03-26 session termination: client 发 DELETE 终止 session。
+    无状态 server 无需真终止，返回 204 让 Reactor 收到 onComplete。"""
+    return Response("", status=204, mimetype="application/json",
+                    headers={"mcp-session-id": _MCP_SESSION_ID})
+
+
 @app.route("/mcp", methods=["OPTIONS"])
 def mcp_options_endpoint():
     """CORS / preflight 探测。钉钉 deap MCP 客户端会发 OPTIONS 探测，
@@ -199,45 +207,55 @@ def mcp_sse_endpoint():
     if not _check_mcp_auth(request):
         return Response("unauthorized", status=401, mimetype="text/plain")
 
-    # streamable-http 协议下，GET 是给 server 主动推消息用的，spec 可选。
-    # 钉钉 client 会 GET 后立即断开（健康探测），不期待持续推送。
-    # 流首发个 SSE 注释让 Content-Type=text/event-stream 解析成功即可。
+    # 钉钉 Reactor 客户端在 SSE 流上等 terminal signal（onComplete），
+    # 我们没有 server→client 主动推送需求，所以发个 SSE 注释后立即关流，
+    # client 收到 EOF=onComplete，不会再卡 8 秒超时。
     def event_stream():
-        import time as _t
         yield ": mcp ready\n\n"
-        try:
-            while True:
-                _t.sleep(25)
-                yield ": keepalive\n\n"
-        except GeneratorExit:
-            return
+        # 不 sleep、不 loop，generator 结束即 close 连接
 
     return Response(
         event_stream(),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # 关键：让 nginx 不要 buffer SSE
-            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 让 nginx 不要 buffer SSE
+            "mcp-session-id": _MCP_SESSION_ID,
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "mcp-session-id",
         },
     )
+
+
+import uuid as _uuid
+
+# 进程级固定 session id（无状态 server 无需真做会话管理，
+# 只为满足 streamable-http spec 2025-03-26 client 期待响应含此 header）
+_MCP_SESSION_ID = _uuid.uuid4().hex
 
 
 def _sse_response(jsonrpc_msg: dict, status: int = 200):
     """把 JSON-RPC response 包成 SSE 单 message 返回。
 
-    钉钉 deap 的 MCP client 在 streamable-http 协议下只接受 text/event-stream
-    作为 POST 响应，application/json 会被误判为 'Unknown media type'。
+    必须用 generator → chunked transfer encoding（参考 mcp 服务器实现），
+    否则 client (钉钉 Reactor) 看到 Content-Length 不知道流是否结束，等 8s 超时。
     """
     import json as _json
-    body = f"event: message\ndata: {_json.dumps(jsonrpc_msg, ensure_ascii=False)}\n\n"
+    body_str = f"event: message\ndata: {_json.dumps(jsonrpc_msg, ensure_ascii=False)}\n\n"
+
+    def gen():
+        yield body_str
+
     return Response(
-        body,
+        gen(),  # generator 触发 chunked transfer，无 Content-Length
         status=status,
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
+            "mcp-session-id": _MCP_SESSION_ID,
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "mcp-session-id",
         },
     )
 
@@ -251,16 +269,18 @@ def mcp_endpoint():
       - 否则 → application/json（spec 允许）
     钉钉 deap 客户端必须走 SSE。
     """
+    # 先读 body 以拿到请求 id（JSON-RPC 协议要求响应 id 与请求 id 匹配）
+    body = request.get_json(silent=True) or {}
+    rpc_id = body.get("id")
+
     if not _check_mcp_auth(request):
-        msg = {"jsonrpc": "2.0", "id": None,
+        msg = {"jsonrpc": "2.0", "id": rpc_id,
                "error": {"code": -32001, "message": "unauthorized"}}
         return _sse_response(msg, status=401)
     if not _ready.is_set():
-        msg = {"jsonrpc": "2.0", "id": None,
+        msg = {"jsonrpc": "2.0", "id": rpc_id,
                "error": {"code": -32000, "message": "warming_up, retry in 5min"}}
         return _sse_response(msg, status=503)
-
-    body = request.get_json(silent=True) or {}
     from .mcp_server import handle_mcp
     try:
         res = handle_mcp(body)
