@@ -14,7 +14,7 @@ import logging
 log = logging.getLogger("mcp")
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "redmine-precheck", "version": "1.0.0"}
+SERVER_INFO = {"name": "redmine-assist", "version": "1.1.0"}
 
 _TOOL_PRECHECK = {
     "name": "precheck",
@@ -38,6 +38,30 @@ _TOOL_PRECHECK = {
             }
         },
         "required": ["description"],
+    },
+}
+
+
+_TOOL_QUERY = {
+    "name": "zhengtong_query",
+    "description": (
+        "政通问答：从公司 17 万历史 Redmine 工单 + 4500 篇钉钉知识库文档中检索方案和经验。"
+        "适用于：查找某类问题的历史解决方案、了解某产品/模块的实施经验、查询公司内部技术文档要点。"
+        "输入越具体召回质量越好，例如'麒舰第三方对接怎么做鉴权'比'对接怎么做'更好。"
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "自然语言问题，应包含产品名/模块名/技术关键词。"
+                    "例如：'麒舰第三方对接怎么做鉴权'、'星桥数据接入SQL脚本怎么写'、'悟空大屏组件数据源配置方法'。"
+                    "禁止过短或过泛（如'怎么做'），应反问用户补充细节。"
+                ),
+            }
+        },
+        "required": ["query"],
     },
 }
 
@@ -72,50 +96,87 @@ def handle_mcp(body: dict) -> dict | None:
         )
 
     if method == "tools/list":
-        return _ok(rpc_id, {"tools": [_TOOL_PRECHECK]})
+        return _ok(rpc_id, {"tools": [_TOOL_PRECHECK, _TOOL_QUERY]})
 
     if method == "tools/call":
         tool_name = params.get("name")
         args = params.get("arguments") or {}
-        if tool_name != "precheck":
-            return _err(rpc_id, -32601, f"unknown tool: {tool_name}")
-        description = (args.get("description") or "").strip()
-        if not description:
-            return _ok(
-                rpc_id,
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "请告诉我具体的对接业务，例如：\n- 对接什么数据（GPS轨迹/视频/业务表）\n- 用什么协议（808/HTTP/库表）\n- 三方系统是谁",
-                        }
-                    ],
-                    "isError": True,
-                },
-            )
-        if len(description) > 4000:
-            return _err(rpc_id, -32602, "description too long (max 4000)")
-        try:
-            # 延迟 import 避免循环
-            from .precheck import run_precheck
-            res = run_precheck(description)
-            md = res.get("markdown") or ""
-            stats = res.get("stats") or {}
-            footer = (
-                f"\n\n*[本次召回: {stats.get('n_issues', 0)} 工单 / "
-                f"{stats.get('n_docs', 0)} 文档片段 / "
-                f"{stats.get('n_clusters', 0)} 类问题模式 / "
-                f"{stats.get('elapsed_ms', 0)/1000:.1f}s]*"
-            )
-            return _ok(
-                rpc_id,
-                {
-                    "content": [{"type": "text", "text": md + footer}],
-                    "isError": False,
-                },
-            )
-        except Exception as e:
-            log.exception("mcp tools/call precheck failed")
-            return _err(rpc_id, -32603, f"internal error: {e}")
+
+        if tool_name == "precheck":
+            description = (args.get("description") or "").strip()
+            if not description:
+                return _ok(
+                    rpc_id,
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "请告诉我具体的对接业务，例如：\n- 对接什么数据（GPS轨迹/视频/业务表）\n- 用什么协议（808/HTTP/库表）\n- 三方系统是谁",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                )
+            if len(description) > 4000:
+                return _err(rpc_id, -32602, "description too long (max 4000)")
+            try:
+                from .precheck import run_precheck
+                res = run_precheck(description)
+                md = res.get("markdown") or ""
+                stats = res.get("stats") or {}
+                footer = (
+                    f"\n\n*[本次召回: {stats.get('n_issues', 0)} 工单 / "
+                    f"{stats.get('n_docs', 0)} 文档片段 / "
+                    f"{stats.get('n_clusters', 0)} 类问题模式 / "
+                    f"{stats.get('elapsed_ms', 0)/1000:.1f}s]*"
+                )
+                return _ok(
+                    rpc_id,
+                    {
+                        "content": [{"type": "text", "text": md + footer}],
+                        "isError": False,
+                    },
+                )
+            except Exception as e:
+                log.exception("mcp tools/call precheck failed")
+                return _err(rpc_id, -32603, f"internal error: {e}")
+
+        if tool_name == "zhengtong_query":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return _ok(
+                    rpc_id,
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "请输入具体问题，例如：\n- 麒舰第三方对接怎么做鉴权\n- 星桥数据接入SQL脚本怎么写\n- 悟空大屏组件数据源配置方法",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                )
+            if len(query) > 4000:
+                return _err(rpc_id, -32602, "query too long (max 4000)")
+            try:
+                from .query import run_query
+                res = run_query(query)
+                md = res.get("markdown") or ""
+                stats = res.get("stats") or {}
+                footer = (
+                    f"\n\n*[耗时: {stats.get('elapsed_ms', 0)/1000:.1f}s]*"
+                )
+                return _ok(
+                    rpc_id,
+                    {
+                        "content": [{"type": "text", "text": md + footer}],
+                        "isError": False,
+                    },
+                )
+            except Exception as e:
+                log.exception("mcp tools/call zhengtong_query failed")
+                return _err(rpc_id, -32603, f"internal error: {e}")
+
+        return _err(rpc_id, -32601, f"unknown tool: {tool_name}")
 
     return _err(rpc_id, -32601, f"method not found: {method}")
