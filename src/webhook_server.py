@@ -165,6 +165,39 @@ def precheck_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
+@app.post("/query")
+def query_endpoint():
+    """政通问答：输入自然语言问题，从 17 万工单 + 4500 文档 chunks 综合答案 + top 10 引用。
+
+    复用 precheck 的 X-Precheck-Token 鉴权（同一 token）。
+    Body: {"query": "...", "top_issues": 15, "top_docs": 10}
+    Response: {"markdown": "...", "stats": {n_issues,n_docs,elapsed_ms}}
+    """
+    if not _ready.is_set():
+        return jsonify({"error": "warming_up", "ready": False}), 503
+    body = request.get_json(silent=True) or {}
+    query_text = (body.get("query") or body.get("description") or "").strip()
+    if not query_text:
+        return jsonify({"error": "query required"}), 400
+    if len(query_text) > 4000:
+        return jsonify({"error": "query too long (max 4000 chars)"}), 400
+    top_issues = int(body.get("top_issues") or 15)
+    top_docs = int(body.get("top_docs") or 10)
+    try:
+        from .query import run_query
+        res = run_query(query_text, top_issues=top_issues, top_docs=top_docs)
+        log.info(
+            "query -> n_issues=%s n_docs=%s ms=%s",
+            res["stats"]["n_issues"],
+            res["stats"]["n_docs"],
+            res["stats"]["elapsed_ms"],
+        )
+        return jsonify(res), 200
+    except Exception as e:
+        log.exception("query failed")
+        return jsonify({"error": str(e)}), 500
+
+
 def _check_mcp_auth(req) -> bool:
     """MCP 端点 Bearer 鉴权。token 配在 cfg.precheck.token；nginx 也校验同 token 兜底。"""
     expected = ((cfg().get("precheck") or {}).get("token") or "").strip()
@@ -210,9 +243,13 @@ def mcp_sse_endpoint():
     # 钉钉 Reactor 客户端在 SSE 流上等 terminal signal（onComplete），
     # 我们没有 server→client 主动推送需求，所以发个 SSE 注释后立即关流，
     # client 收到 EOF=onComplete，不会再卡 8 秒超时。
+    import time as _t
     def event_stream():
-        yield ": mcp ready\n\n"
-        # 不 sleep、不 loop，generator 结束即 close 连接
+        # 钉钉 Reactor MCP client 在 GET SSE 流上等 event signal，
+        # 8s 内没收到就报 timeout。持续发 heartbeat event 保活。
+        while True:
+            yield "event: heartbeat\ndata: {}\n\n"
+            _t.sleep(5)  # 每 5s 一次，远小于 8s 超时
 
     return Response(
         event_stream(),

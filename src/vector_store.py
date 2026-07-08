@@ -209,16 +209,22 @@ class VectorStore:
         top: int,
         exclude_id: int | None = None,
         tracker_filter: set[int] | None = None,
+        tracker_exclude: set[int] | None = None,
     ) -> list[dict]:
-        """KNN 召回。tracker_filter 非空时仅返回 tracker_id ∈ filter 的工单。
+        """KNN 召回。
+          - tracker_filter 非空：仅返回 tracker_id ∈ filter 的工单（白名单，precheck 用）
+          - tracker_exclude 非空：排除 tracker_id ∈ exclude 的工单（黑名单，query 用）
+        两者互斥（同时给则报错）。
 
-        实现：faiss 过召集（top × 8）→ SQL 按 tracker_id IN(...) 过滤 → 截 top。
-        过召集是为了应对 tracker 命中率低（最坏 25%）仍能凑够 top。
+        实现：faiss 过召集（top × 8）→ SQL WHERE 过滤 → 截 top。
+        过召集应对过滤命中率低（最坏 25%）仍能凑够 top。
         """
+        if tracker_filter and tracker_exclude:
+            raise ValueError("tracker_filter and tracker_exclude are mutually exclusive")
         if self._index.ntotal == 0:
             return []
         q = _l2_normalize(np.asarray(embedding, dtype="float32")).reshape(1, -1)
-        over = 8 if tracker_filter else 1
+        over = 8 if (tracker_filter or tracker_exclude) else 1
         k = (top + (1 if exclude_id else 0)) * over
         D, I = self._index.search(q, k)  # D: cos sim, I: issue_id
         out: list[dict] = []
@@ -234,6 +240,10 @@ class VectorStore:
         if tracker_filter:
             tracker_list = list(tracker_filter)
             sql += " AND tracker_id IN (" + ",".join("?" * len(tracker_list)) + ")"
+            params += tracker_list
+        elif tracker_exclude:
+            tracker_list = list(tracker_exclude)
+            sql += " AND (tracker_id IS NULL OR tracker_id NOT IN (" + ",".join("?" * len(tracker_list)) + "))"
             params += tracker_list
         rows = self.conn.execute(sql, params).fetchall()
         meta_by_id = {r[0]: r for r in rows}
