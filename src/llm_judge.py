@@ -41,6 +41,10 @@ def _call(messages: list[dict], max_tokens: int | None = None) -> str:
         "max_tokens": max_tokens or c.get("max_tokens", 800),
         "response_format": {"type": "json_object"},
     }
+    # MiniMax-M3 默认开启 thinking，会把 <think>...</think> 混入 content，
+    # 导致 json.loads 失败。配置了 llm.thinking 时显式下发（如 {"type":"disabled"}）。
+    if c.get("thinking"):
+        payload["thinking"] = c["thinking"]
     r = requests.post(
         c["endpoint"],
         headers={

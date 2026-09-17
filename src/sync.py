@@ -469,6 +469,77 @@ def run_once(max_items: int | None = None) -> dict:
         triage_res = run_triage(rows, journals_by_id, db)
         triage_skipped = triage_res.get("rnd", 0) + triage_res.get("path", 0)
 
+        # === 自动 review：本轮流转到"已关闭"的案件立即触发 LLM 评估 ===
+        # 只对以下都满足的案件触发：
+        #   - assist_log 存在（AI 之前写过一楼）
+        #   - 本次 status 变成 is_closed=1
+        #   - review_log 未评过（去重）
+        #   - form 有实际方案内容
+        auto_reviewed = 0
+        auto_review_errors = 0
+        closed_status_ids = {
+            sid for sid, meta in status_map.items() if meta.get("is_closed")
+        }
+        newly_closed_ids: list[int] = []
+        for it in rows:
+            if it.get("status_id") in closed_status_ids:
+                newly_closed_ids.append(it["id"])
+        if newly_closed_ids:
+            import sqlite3 as _sq3
+            from .review import review_one as _rev_one
+            log_path = project_root() / cfg()["storage"]["log_db"]
+            lc = _sq3.connect(str(log_path))
+            # 只留 assist_log 里存在 + review_log 里未评过
+            ph = ",".join("?" for _ in newly_closed_ids)
+            in_assist = {
+                r[0] for r in lc.execute(
+                    f"SELECT issue_id FROM assist_log WHERE note_written=1 "
+                    f"AND issue_id IN ({ph})",
+                    newly_closed_ids,
+                ).fetchall()
+            }
+            reviewed = set()
+            try:
+                reviewed = {
+                    r[0] for r in lc.execute(
+                        f"SELECT issue_id FROM review_log WHERE issue_id IN ({ph})",
+                        newly_closed_ids,
+                    ).fetchall()
+                }
+            except _sq3.OperationalError:
+                pass
+            candidates = [
+                iid for iid in newly_closed_ids
+                if iid in in_assist and iid not in reviewed
+            ]
+            if candidates:
+                # 检查 form 有内容
+                ph2 = ",".join("%s" for _ in candidates)
+                with db._conn() as (_, cur):
+                    cur.execute(
+                        f"""SELECT DISTINCT issue_id FROM form_develop_finish
+                              WHERE issue_id IN ({ph2})
+                                AND function_description IS NOT NULL
+                                AND function_description != ''
+                            UNION
+                            SELECT DISTINCT issue_id FROM form_tester_verify
+                              WHERE issue_id IN ({ph2})
+                                AND test_result IS NOT NULL
+                                AND test_result != ''""",
+                        tuple(candidates) + tuple(candidates),
+                    )
+                    gold = {r["issue_id"] for r in cur.fetchall()}
+                to_review = [iid for iid in candidates if iid in gold]
+                for iid in to_review:
+                    try:
+                        # 关闭时自动写楼（gczx 身份，poor 时才写）
+                        _rev_one(iid, dry_run_write=False)
+                        auto_reviewed += 1
+                    except Exception:
+                        auto_review_errors += 1
+                        import traceback as _tb
+                        _tb.print_exc()
+
         # 更新 state（向前推 1 秒避免边界重复扫同一条）
         new_state = dict(state)
         new_state["last_sync_at"] = max_updated_on.strftime("%Y-%m-%d %H:%M:%S")
@@ -482,6 +553,8 @@ def run_once(max_items: int | None = None) -> dict:
         new_state["last_run_triage_skipped"] = triage_skipped
         new_state["last_run_triage_rnd"] = triage_res.get("rnd", 0)
         new_state["last_run_triage_path"] = triage_res.get("path", 0)
+        new_state["last_run_auto_reviewed"] = auto_reviewed
+        new_state["last_run_auto_review_errors"] = auto_review_errors
         _save_state(new_state)
 
         return {
@@ -494,6 +567,8 @@ def run_once(max_items: int | None = None) -> dict:
             "triage_skipped": triage_skipped,
             "triage_rnd": triage_res.get("rnd", 0),
             "triage_path": triage_res.get("path", 0),
+            "auto_reviewed": auto_reviewed,
+            "auto_review_errors": auto_review_errors,
             "since": last_str,
             "new_last_sync_at": new_state["last_sync_at"],
             "elapsed_ms": int((time.time() - t0) * 1000),

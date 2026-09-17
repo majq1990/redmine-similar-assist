@@ -20,14 +20,16 @@ embedding:
   dim: 1024
   batch_size: 16
 
-# LLM：DeepSeek
+# LLM：MiniMax-M3（OpenAI 兼容）
 llm:
-  endpoint: "https://api.deepseek.com/v1/chat/completions"
-  api_key: "TODO_DEEPSEEK_API_KEY"
-  # 必须用 deepseek-v4-flash（便宜款）；严禁换 deepseek-v4-pro
-  model: "deepseek-v4-flash"
+  endpoint: "https://api.minimax.cn/v1/chat/completions"
+  api_key: "TODO_MINIMAX_API_KEY"
+  model: "MiniMax-M3"
   temperature: 0.1
-  max_tokens: 800
+  max_tokens: 3000
+  # MiniMax-M3 默认开 thinking，会把 <think>...</think> 混入 content 破坏 JSON；
+  # 必须显式 disabled。切回 DeepSeek 等不支持该参数的模型时删掉本行即可。
+  thinking: {"type": "disabled"}
 
 # 相似度阈值与召回参数
 recall:
